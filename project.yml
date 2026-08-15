@@ -30,11 +30,15 @@ targets:
         CODE_SIGN_ENTITLEMENTS: App/WhisperKeyboard.entitlements
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_STYLE: Automatic
-        # A real Team ID (not ad-hoc) so the app's code signature — and therefore its TCC
-        # identity for Accessibility/Microphone — stays stable across rebuilds. Without
-        # this, every rebuild got a fresh ad-hoc signature and macOS treated it as a brand
-        # new, never-approved app each time.
-        DEVELOPMENT_TEAM: 4B77T9V8P8
+        # DEVELOPMENT_TEAM is intentionally omitted rather than hardcoded: it's
+        # machine/account-specific, so a value that works on one Mac breaks the build on
+        # anyone else's. Xcode resolves it per-developer from whichever Apple ID is signed
+        # into Xcode > Settings > Accounts (a free personal team is enough — no paid
+        # Developer Program needed). The first build must happen from the Xcode GUI so it
+        # can prompt for/create that team; after that, `xcodebuild` from the CLI works too.
+        # A real (non-ad-hoc) team matters because the app's code signature is also its TCC
+        # identity for Accessibility/Microphone — with no team, every rebuild gets a fresh
+        # ad-hoc signature and macOS treats it as a brand new, never-approved app each time.
         PRODUCT_BUNDLE_IDENTIFIER: com.omar.whisperkeyboard
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"

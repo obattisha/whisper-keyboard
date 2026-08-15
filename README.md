@@ -34,20 +34,46 @@ acceleration — no cloud API, no subscription.
    ```
    This installs XcodeGen (if needed), fetches the whisper.cpp submodule, builds
    `whisper.xcframework` with Metal support, and generates `WhisperKeyboard.xcodeproj`.
-3. Open `WhisperKeyboard.xcodeproj` in Xcode, press **Cmd+R**. First launch walks you
-   through downloading the model and granting Microphone + Accessibility permissions.
+3. Open `WhisperKeyboard.xcodeproj` in Xcode and press **Cmd+R** — build from the Xcode
+   GUI the first time, not `xcodebuild` from the command line. The project has no
+   `DEVELOPMENT_TEAM` hardcoded (that's account-specific, so a value that works on one Mac
+   would just break the build on anyone else's); Xcode resolves it from whichever Apple ID
+   is signed into **Xcode > Settings > Accounts**, prompting you to sign in and pick
+   "Automatically manage signing" if you haven't already. A free personal team is enough —
+   no paid Apple Developer Program membership needed. Once resolved this way, subsequent
+   `Cmd+R`/`xcodebuild` builds keep using it — you only need the GUI step again if you
+   re-run `xcodegen generate` (e.g. after adding new source files), which regenerates
+   `WhisperKeyboard.xcodeproj` from scratch.
+4. First launch walks you through downloading the model and granting Microphone +
+   Accessibility permissions.
 
 Default hotkey is **⌃⌥Space** (hold to talk) — changeable from the menu bar icon's
 "Change Hotkey…" item.
 
+Since you're building from source, macOS never quarantines the app the way it would a
+downloaded binary — there's no Gatekeeper "unidentified developer" warning to click
+through.
+
+## Installing permanently
+
+`Cmd+R` runs the app straight out of Xcode's DerivedData folder, which is fine for
+iterating but not for daily use. Once the Xcode GUI build from step 3 above has succeeded
+at least once (so your signing team is resolved), run:
+```
+./Scripts/install.sh
+```
+This builds a Release configuration and installs it to `/Applications/WhisperKeyboard.app`.
+Launch it from Spotlight/Launchpad/Finder going forward, and grant Microphone/Accessibility
+once when prompted — that grant persists across future `install.sh` reruns as long as the
+same Apple ID/team keeps signing it.
+
 ## Model verification
 
-`ModelManager` pins an expected SHA-256 for each model file and refuses to use a download
-that doesn't match. **The placeholder hashes in
-`Packages/TranscriptionKit/Sources/TranscriptionKit/Types.swift` must be replaced** with
-the real digests from https://huggingface.co/ggerganov/whisper.cpp before first use —
-`Scripts/fetch-model.sh` prints the actual hash of what it downloads if you need to
-re-verify.
+`ModelManager` pins an expected SHA-256 for each model file (`Types.swift`) and refuses to
+use a download that doesn't match — verified against the Git LFS OIDs from
+https://huggingface.co/ggerganov/whisper.cpp. If whisper.cpp ever ships new model files
+upstream, `Scripts/fetch-model.sh` prints the actual hash of what it downloads so you can
+re-pin them.
 
 ## Development
 
@@ -59,6 +85,8 @@ re-verify.
   since rebuilding from Xcode can churn the code signature TCC keys off of).
 - Adding new source files: re-run `xcodegen generate` (or `./Scripts/setup.sh` again) —
   `WhisperKeyboard.xcodeproj` is generated from `project.yml` and is not committed to git.
+  This wipes the signing team Xcode resolved earlier, so open the regenerated project once
+  in the Xcode GUI to re-pick it before your next `Cmd+R` or `install.sh`.
 
 ## Known limitations (v1)
 
