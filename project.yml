@@ -1,0 +1,56 @@
+name: WhisperKeyboard
+options:
+  bundleIdPrefix: com.omar.whisperkeyboard
+  deploymentTarget:
+    macOS: "13.0"
+
+packages:
+  TranscriptionKit:
+    path: Packages/TranscriptionKit
+  AudioCaptureKit:
+    path: Packages/AudioCaptureKit
+  InputInjectionKit:
+    path: Packages/InputInjectionKit
+  KeyboardShortcuts:
+    url: https://github.com/sindresorhus/KeyboardShortcuts
+    from: 1.9.0
+
+targets:
+  WhisperKeyboard:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+        excludes:
+          - Info.plist
+          - WhisperKeyboard.entitlements
+    settings:
+      base:
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/WhisperKeyboard.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        # A real Team ID (not ad-hoc) so the app's code signature — and therefore its TCC
+        # identity for Accessibility/Microphone — stays stable across rebuilds. Without
+        # this, every rebuild got a fresh ad-hoc signature and macOS treated it as a brand
+        # new, never-approved app each time.
+        DEVELOPMENT_TEAM: 4B77T9V8P8
+        PRODUCT_BUNDLE_IDENTIFIER: com.omar.whisperkeyboard
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        # Hardened Runtime is OFF for local dev: with no paid Developer ID team, the app
+        # and the vendored whisper.framework are each independently ad-hoc signed (no
+        # shared Team ID), and Hardened Runtime's library validation refuses to load a
+        # framework whose signing identity doesn't match the host app's — even when both
+        # are "adhoc". Turn this back on (and re-sign consistently) if this is ever
+        # distributed via Developer ID + notarization.
+        ENABLE_HARDENED_RUNTIME: NO
+        # No com.apple.security.app-sandbox entitlement — see WhisperKeyboard.entitlements
+        # for why sandboxing is incompatible with the Accessibility-based text insertion
+        # this app depends on.
+    dependencies:
+      - package: TranscriptionKit
+      - package: AudioCaptureKit
+      - package: InputInjectionKit
+      - package: KeyboardShortcuts

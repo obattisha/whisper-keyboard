@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	Intentionally empty / NOT sandboxed (no com.apple.security.app-sandbox key): a
+	sandboxed app can never appear in System Settings > Accessibility, so
+	AXIsProcessTrusted() would always return false and text insertion would be
+	permanently unavailable. Microphone access for a non-sandboxed app is governed by
+	Info.plist's NSMicrophoneUsageDescription + the TCC prompt, not an entitlement.
+	This rules out Mac App Store distribution by design — fine for personal use; if this
+	is ever shared beyond this machine, distribute via Developer ID signing + notarization.
+	-->
+</dict>
+</plist>
