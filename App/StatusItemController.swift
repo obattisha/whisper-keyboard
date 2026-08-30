@@ -54,9 +54,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         NotificationCenter.default.addObserver(
             forName: AppSettings.modelVariantDidChange, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.engine = nil
-            self?.loadModelIfAvailable()
-            self?.refresh()
+            Task { @MainActor [weak self] in
+                self?.engine = nil
+                self?.loadModelIfAvailable()
+                self?.refresh()
+            }
         }
     }
 

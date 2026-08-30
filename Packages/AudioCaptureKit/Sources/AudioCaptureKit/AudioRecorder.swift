@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 
 public enum AudioRecorderError: Error {
     case microphonePermissionDenied

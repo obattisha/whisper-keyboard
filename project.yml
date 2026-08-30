@@ -2,7 +2,7 @@ name: WhisperKeyboard
 options:
   bundleIdPrefix: com.omar.whisperkeyboard
   deploymentTarget:
-    macOS: "13.0"
+    macOS: "13.3"
     iOS: "16.0"
 
 packages:
