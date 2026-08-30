@@ -14,7 +14,17 @@ public final class AudioRecorder {
     public static let whisperSampleRate: Double = 16_000
 
     private let engine = AVAudioEngine()
+    // The *output* format is fixed — this is what whisper.cpp requires, not a guess about
+    // the microphone. What must never be hardcoded is the *input* side (see start()).
+    private let targetFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: AudioRecorder.whisperSampleRate,
+        channels: 1,
+        interleaved: false
+    )!
     private var converter: AVAudioConverter?
+    private var converterInputFormat: AVAudioFormat?
+    private var configChangeObserver: NSObjectProtocol?
     private var accumulatedSamples: [Float] = []
     private var recordingStartedAt: Date?
 
@@ -48,24 +58,47 @@ public final class AudioRecorder {
         try session.setActive(true, options: .notifyOthersOnDeactivation)
         #endif
 
-        let inputNode = engine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-        guard let targetFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: Self.whisperSampleRate,
-            channels: 1,
-            interleaved: false
-        ), let converter = AVAudioConverter(from: inputFormat, to: targetFormat) else {
-            throw AudioRecorderError.converterInitializationFailed
-        }
-        self.converter = converter
+        converter = nil
+        converterInputFormat = nil
+        installTap()
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            self?.consume(buffer: buffer, converter: converter, targetFormat: targetFormat)
+        // Bluetooth headphones commonly switch profile the instant the mic is engaged —
+        // from A2DP (~44.1/48kHz, output-only) to HFP "headset" mode (often 8kHz or
+        // 16kHz, mono) so they can carry input too. That switch is asynchronous and can
+        // still be mid-flight when start() reaches installTap() above, or can land after
+        // recording has already begun. Either way the actual hardware format changes out
+        // from under us; this notification is how the engine tells us that happened so we
+        // can rebuild against whatever the new real format is, instead of crashing on a
+        // stale one asserted up front.
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.installTap()
+            }
         }
 
         engine.prepare()
         try engine.start()
+    }
+
+    /// (Re)installs the tap against the input node's *current* native format. Deliberately
+    /// does not assert a specific sample rate/channel count here (the old code passed a
+    /// format captured once at start()) — on a Bluetooth headset that format can already be
+    /// stale by the time the engine actually starts, or go stale mid-recording, and
+    /// asserting a mismatched one crashes. Passing `nil` makes the engine always hand back
+    /// buffers in whatever the hardware is actually doing right now; `consume(buffer:)`
+    /// builds the converter from that live format rather than a cached one.
+    private func installTap() {
+        let inputNode = engine.inputNode
+        if engine.isRunning {
+            inputNode.removeTap(onBus: 0)
+        }
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+            self?.consume(buffer: buffer)
+        }
     }
 
     /// Guard against accidental taps producing near-empty buffers — very short clips can
@@ -75,9 +108,14 @@ public final class AudioRecorder {
     /// Stops capturing and returns the accumulated samples, or nil if the hold was too
     /// short to be a real utterance.
     public func stopAndCapture() -> [Float]? {
+        if let observer = configChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configChangeObserver = nil
+        }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         converter = nil
+        converterInputFormat = nil
 
         #if os(iOS)
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
@@ -95,7 +133,17 @@ public final class AudioRecorder {
         return accumulatedSamples
     }
 
-    private func consume(buffer: AVAudioPCMBuffer, converter: AVAudioConverter, targetFormat: AVAudioFormat) {
+    private func consume(buffer: AVAudioPCMBuffer) {
+        // Rebuild the converter whenever the incoming format actually changes: the first
+        // buffer of a recording, or any buffer after a mid-recording headset mode switch
+        // (belt-and-suspenders alongside the configuration-change notification above, in
+        // case a format shift shows up in the buffers before that notification fires).
+        if converter == nil || !(converterInputFormat?.isEqual(to: buffer.format) ?? false) {
+            converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+            converterInputFormat = buffer.format
+        }
+        guard let converter else { return }
+
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
         let outputCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
         guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputCapacity) else {
