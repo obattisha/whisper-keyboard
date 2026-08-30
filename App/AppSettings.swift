@@ -31,7 +31,9 @@ final class AppSettings: ObservableObject {
     private init() {
         let defaults = UserDefaults.standard
         languageHint = defaults.string(forKey: Keys.languageHint).flatMap { LanguageHint(rawValue: $0) } ?? .auto
-        modelVariant = defaults.string(forKey: Keys.modelVariant).flatMap { WhisperModelVariant(rawValue: $0) } ?? .largeV3Turbo
+        // Q5 by default: smallest download, fastest, and still multilingual — the best
+        // fit for first-run setup. Users can pick a heavier variant from the Model menu.
+        modelVariant = defaults.string(forKey: Keys.modelVariant).flatMap { WhisperModelVariant(rawValue: $0) } ?? .largeV3TurboQ5
         hasCompletedOnboarding = defaults.bool(forKey: Keys.hasCompletedOnboarding)
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }

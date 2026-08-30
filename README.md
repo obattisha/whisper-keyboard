@@ -2,8 +2,10 @@
 
 Local, offline dictation for macOS and iOS. On the Mac, hold a hotkey, speak (English or
 Arabic), release — the transcribed text is inserted at your cursor. Runs OpenAI's Whisper
-(`large-v3-turbo`) entirely on-device via [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
-with Metal acceleration — no cloud API, no subscription.
+entirely on-device via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) with Metal
+acceleration — no cloud API, no subscription. Defaults to the Q5-quantized `large-v3-turbo`
+(574MB, multilingual, fastest to download and run); switch to the full `large-v3-turbo` or
+the faster-but-English-only `distil-large-v3` from the menu bar's Model menu.
 
 ## Architecture
 
