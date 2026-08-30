@@ -16,6 +16,8 @@ private enum DictationState {
     case idle
     case recording
     case transcribing
+    case downloadingModel(progress: Double)
+    case loadingModel
     case error(String)
 }
 
@@ -32,6 +34,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private let statusLineItem = NSMenuItem(title: "Idle", action: nil, keyEquivalent: "")
     private let accessibilityItem = NSMenuItem(title: "Grant Accessibility Permission…", action: #selector(grantAccessibility), keyEquivalent: "")
+    private let downloadModelItem = NSMenuItem(title: "Download Model…", action: #selector(downloadCurrentModel), keyEquivalent: "")
     private var languageItems: [LanguageHint: NSMenuItem] = [:]
     private var modelItems: [WhisperModelVariant: NSMenuItem] = [:]
     private let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
@@ -66,6 +69,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// If it isn't, onboarding is responsible for downloading it first — this just covers
     /// normal app launches after setup is complete.
     func loadModelIfAvailable() {
+        guard case .loadingModel = state else {
+            startLoadingModel()
+            return
+        }
+        // Already loading (e.g. called again from onboarding's completion callback right
+        // after the app-launch call already started one) — let that one finish.
+    }
+
+    private func startLoadingModel() {
         Task {
             let variant = settings.modelVariant
             guard await ModelManager.shared.isDownloaded(variant) else {
@@ -74,15 +86,47 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             }
             let path = await ModelManager.shared.localURL(for: variant).path
             logger.notice("loadModelIfAvailable: loading \(variant.rawValue, privacy: .public) from \(path, privacy: .public)")
+            // Loading a multi-gigabyte model (mmap + Metal shader compilation) can take
+            // real time — without a distinct state here, the status line kept showing
+            // "Idle" throughout, so a hotkey press mid-load hit the "Model not loaded"
+            // error below even though loading was already happening automatically.
+            state = .loadingModel
             let newEngine = WhisperEngine(modelPath: path)
             do {
                 try await newEngine.loadModel()
                 engine = newEngine
+                state = .idle
                 logger.notice("loadModelIfAvailable: model loaded successfully")
             } catch {
                 logger.error("loadModelIfAvailable: failed to load model: \(String(describing: error), privacy: .public)")
                 state = .error("Failed to load model")
             }
+        }
+    }
+
+    /// Downloads `variant` (no-op if already present) and, on success, loads it. Drives
+    /// the menu bar's "Downloading model… N%" state so this is safe to call directly from
+    /// a menu click — the Model submenu (selecting an undownloaded variant) and the
+    /// "Download Model…" item (shown whenever no model is loaded) both go through this.
+    private func downloadAndLoad(_ variant: WhisperModelVariant) {
+        state = .downloadingModel(progress: 0)
+        Task {
+            do {
+                try await ModelManager.shared.download(variant) { progress in
+                    let fraction = progress.totalBytes > 0
+                        ? Double(progress.bytesWritten) / Double(progress.totalBytes)
+                        : 0
+                    Task { @MainActor [weak self] in
+                        self?.state = .downloadingModel(progress: fraction)
+                    }
+                }
+            } catch {
+                logger.error("downloadAndLoad: download failed: \(String(describing: error), privacy: .public)")
+                state = .error("Model download failed")
+                return
+            }
+            state = .idle
+            loadModelIfAvailable()
         }
     }
 
@@ -196,6 +240,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         launchAtLoginItem.target = self
         menu.addItem(launchAtLoginItem)
 
+        downloadModelItem.target = self
+        menu.addItem(downloadModelItem)
+
         accessibilityItem.target = self
         menu.addItem(accessibilityItem)
 
@@ -226,6 +273,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         case .transcribing:
             statusLineItem.title = "Transcribing…"
             statusItem.button?.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
+        case .downloadingModel(let progress):
+            statusLineItem.title = "Downloading model… \(Int(progress * 100))%"
+            statusItem.button?.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+        case .loadingModel:
+            statusLineItem.title = "Loading model…"
+            statusItem.button?.image = NSImage(systemSymbolName: "hourglass", accessibilityDescription: nil)
         case .error(let message):
             statusLineItem.title = message
             statusItem.button?.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
@@ -236,9 +289,31 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         for (variant, item) in modelItems {
             item.state = (variant == settings.modelVariant) ? .on : .off
+            Task {
+                let isDownloaded = await ModelManager.shared.isDownloaded(variant)
+                item.title = isDownloaded ? variant.displayName : "\(variant.displayName) (not downloaded)"
+            }
         }
         launchAtLoginItem.state = settings.launchAtLogin ? .on : .off
         accessibilityItem.isHidden = TextInserter.isAccessibilityTrusted
+
+        // Only surface this when there's actually something for the user to trigger: not
+        // while a download/load is already automatically in progress, and not once a model
+        // is loaded — just when nothing is loaded and nothing is already working on it
+        // (fresh install with no model yet, or a load/download that failed).
+        switch state {
+        case .downloadingModel, .loadingModel:
+            downloadModelItem.isHidden = true
+        default:
+            downloadModelItem.isHidden = engine != nil
+            if engine == nil {
+                let variant = settings.modelVariant
+                Task {
+                    let isDownloaded = await ModelManager.shared.isDownloaded(variant)
+                    downloadModelItem.title = isDownloaded ? "Load Model…" : "Download Model…"
+                }
+            }
+        }
     }
 
     // MARK: - Actions
@@ -253,6 +328,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard let variant = sender.representedObject as? WhisperModelVariant else { return }
         settings.modelVariant = variant
         refresh()
+        Task {
+            if await !ModelManager.shared.isDownloaded(variant) {
+                downloadAndLoad(variant)
+            }
+        }
+    }
+
+    @objc private func downloadCurrentModel() {
+        downloadAndLoad(settings.modelVariant)
     }
 
     @objc private func toggleLaunchAtLogin() {

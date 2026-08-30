@@ -25,8 +25,11 @@ final class OnboardingWindowController: NSWindowController {
         super.init(window: window)
 
         window.contentView = NSHostingView(rootView: OnboardingView(onComplete: { [weak self] in
-            onComplete()
+            // Close first: `onComplete()` (AppDelegate's) clears its only strong reference
+            // to this controller, deallocating it — call it after `close()` and `self` here
+            // is already nil, silently no-opping the close.
             self?.close()
+            onComplete()
         }))
     }
 
