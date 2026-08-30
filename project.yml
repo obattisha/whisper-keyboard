@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: com.omar.whisperkeyboard
   deploymentTarget:
     macOS: "13.0"
+    iOS: "16.0"
 
 packages:
   TranscriptionKit:
@@ -58,3 +59,26 @@ targets:
       - package: AudioCaptureKit
       - package: InputInjectionKit
       - package: KeyboardShortcuts
+
+  WhisperKeyboardMobile:
+    type: application
+    platform: iOS
+    sources:
+      - path: iOSApp
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        INFOPLIST_FILE: iOSApp/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        # Same reasoning as the macOS target: no hardcoded DEVELOPMENT_TEAM, resolved
+        # per-developer via Xcode's GUI on first build (free personal team is enough).
+        PRODUCT_BUNDLE_IDENTIFIER: com.omar.whisperkeyboard.mobile
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1" # iPhone only
+    dependencies:
+      - package: TranscriptionKit
+      - package: AudioCaptureKit

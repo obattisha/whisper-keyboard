@@ -39,6 +39,15 @@ public final class AudioRecorder {
         accumulatedSamples.removeAll(keepingCapacity: true)
         recordingStartedAt = Date()
 
+        // macOS has no AVAudioSession — mic routing there is governed purely by TCC
+        // authorization (checked above) plus AVAudioEngine's own input node. iOS requires
+        // this activation step first, or engine.start() throws.
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.record, mode: .measurement)
+        try session.setActive(true, options: .notifyOthersOnDeactivation)
+        #endif
+
         let inputNode = engine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
         guard let targetFormat = AVAudioFormat(
@@ -69,6 +78,10 @@ public final class AudioRecorder {
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         converter = nil
+
+        #if os(iOS)
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        #endif
 
         let duration = recordingStartedAt.map { Date().timeIntervalSince($0) } ?? 0
         recordingStartedAt = nil

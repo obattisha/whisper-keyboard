@@ -1,24 +1,31 @@
 # whisper-keyboard
 
-Local, offline dictation for macOS. Hold a hotkey, speak (English or Arabic), release —
-the transcribed text is inserted at your cursor. Runs OpenAI's Whisper (`large-v3-turbo`)
-entirely on-device via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) with Metal
-acceleration — no cloud API, no subscription.
+Local, offline dictation for macOS and iOS. On the Mac, hold a hotkey, speak (English or
+Arabic), release — the transcribed text is inserted at your cursor. Runs OpenAI's Whisper
+(`large-v3-turbo`) entirely on-device via [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
+with Metal acceleration — no cloud API, no subscription.
 
 ## Architecture
 
 - `Packages/TranscriptionKit` — Swift facade over whisper.cpp (`WhisperEngine`) and model
-  download/verification (`ModelManager`). Platform-agnostic; this is what a future iOS
-  shell would reuse unchanged.
+  download/verification (`ModelManager`). Platform-agnostic, used unchanged by both the
+  macOS and iOS targets.
 - `Packages/AudioCaptureKit` — microphone capture via `AVAudioEngine`, resampled to the
-  16kHz mono Float32 format Whisper expects.
+  16kHz mono Float32 format Whisper expects. Shared by both targets; the iOS side adds a
+  small `AVAudioSession` activation step macOS doesn't need.
 - `Packages/InputInjectionKit` — macOS-only. Inserts text via the Accessibility API, with
-  a clipboard-paste fallback for apps with weak AX trees (browsers, Electron, Terminal).
-- `App/` — the menu bar shell: status item, hotkey wiring, settings, first-run onboarding.
+  a clipboard-paste fallback for apps with weak AX trees (browsers, Electron, Terminal). No
+  iOS equivalent exists (see "iOS companion app" below for how iOS delivers text instead).
+- `App/` — the macOS menu bar shell: status item, hotkey wiring, settings, first-run
+  onboarding.
+- `iOSApp/` — the iOS companion app: a SwiftUI recording screen plus a `DictateIntent`
+  (`AppIntents`) that's assignable to the Action Button or the Shortcuts app.
 - `Vendor/whisper.cpp` — git submodule, pinned to a tagged release. Built into
   `whisper.xcframework` via whisper.cpp's own `build-xcframework.sh` (the officially
   supported Apple-platform integration path — it handles Metal shader embedding, which is
-  a known pain point when hand-vendoring ggml's C sources into a custom SPM target).
+  a known pain point when hand-vendoring ggml's C sources into a custom SPM target). This
+  produces macOS *and* iOS device/simulator slices in one pass — `Scripts/setup.sh`
+  already builds everything both targets need.
 
 ## First-time setup
 
@@ -67,6 +74,31 @@ Launch it from Spotlight/Launchpad/Finder going forward, and grant Microphone/Ac
 once when prompted — that grant persists across future `install.sh` reruns as long as the
 same Apple ID/team keeps signing it.
 
+## iOS companion app
+
+iOS has no Accessibility API and custom keyboard extensions run under a memory ceiling
+(~48MB) that a Whisper model can't fit in — so this isn't a system keyboard, and can't
+insert text at the cursor in an arbitrary app the way the macOS version does. Instead it's
+a standalone app you trigger via the **Action Button** (or the Shortcuts app on phones
+without one): tap to open the app and start recording, tap again in-app to stop — the
+transcript lands on your clipboard, ready to paste anywhere.
+
+1. In `WhisperKeyboard.xcodeproj`, switch the scheme to **WhisperKeyboardMobile** and pick
+   your iPhone (or a Simulator, though the Action Button and real microphone input only
+   work on a physical device) as the destination, then **Cmd+R**. Same first-time signing
+   note as the macOS target applies — Xcode resolves your team via a signed-in Apple ID.
+2. First launch walks you through granting Microphone access and downloading the model
+   (defaults to the smaller Q5-quantized variant — 574MB — since phone storage/RAM is more
+   constrained than a Mac).
+3. To assign it to the **Action Button**: open the Shortcuts app, create a new shortcut
+   using the "Dictate" action (whisper-keyboard's `DictateIntent`), save it, then in
+   **Settings > Action Button > Shortcut**, pick that shortcut.
+
+This is a first pass, not feature parity with the macOS app: the Action Button only
+fixed-trigger-fires third-party actions (no true continuous hold-to-record the way physical
+hotkeys or Apple's own Camera/Voice Memo actions get), and delivery is clipboard-paste
+rather than seamless cursor insertion.
+
 ## Model verification
 
 `ModelManager` pins an expected SHA-256 for each model file (`Types.swift`) and refuses to
@@ -99,6 +131,9 @@ re-pin them.
   notarization if ever needed.
 - Batch transcription only (whisper.cpp runs once per utterance on hotkey release), not
   streaming. Fine for hold-to-talk lengths; would need revisiting for very long holds.
-- iOS is not implemented — `TranscriptionKit`/`AudioCaptureKit` are written to be reusable
-  by a future iOS target; `InputInjectionKit` is macOS-only by nature and would need an
-  iOS-appropriate replacement (or removal, if text is just returned to the host app).
+- iOS is a first pass, not feature parity — see "iOS companion app" above. Notably: no
+  continuous hold-to-record (Action Button fixed-trigger-fires third-party actions once,
+  not held-and-released), and clipboard-paste delivery instead of cursor insertion (no iOS
+  equivalent of the Accessibility API `InputInjectionKit` uses on macOS).
+- The iOS Simulator can't test the Action Button (no physical button) or real microphone
+  input — those need a physical device.
