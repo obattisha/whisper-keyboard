@@ -71,4 +71,15 @@ public enum WhisperModelVariant: String, Codable, CaseIterable, Sendable {
         case .distilLargeV3: return "distil-large-v3 (1.5 GB, ~5x faster, English-only)"
         }
     }
+
+    /// Whether this variant was trained on languages beyond English. Forcing a
+    /// LanguageHint the model can't actually do (e.g. Arabic into an English-only model)
+    /// pushes a language token whisper.cpp doesn't understand rather than gracefully
+    /// falling back, so the UI uses this to keep that combination from being selectable.
+    public var isMultilingual: Bool {
+        switch self {
+        case .largeV3Turbo, .largeV3TurboQ5: return true
+        case .distilLargeV3: return false
+        }
+    }
 }

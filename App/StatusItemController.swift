@@ -39,6 +39,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var modelItems: [WhisperModelVariant: NSMenuItem] = [:]
     private let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
 
+    // Insertion has no reliable success signal — the clipboard-paste fallback just sends
+    // ⌘V into whatever's frontmost, which can be a genuine no-op (no text field focused)
+    // with no error thrown. Keeping every transcription here, in memory only (cleared on
+    // quit, never written to disk — dictated speech can be sensitive), is the safety net:
+    // it's recorded before insertion is even attempted, so a lost paste is still copyable.
+    private let recentTranscriptionsParent = NSMenuItem(title: "Recent Transcriptions", action: nil, keyEquivalent: "")
+    private var recentTranscriptions: [String] = []
+    private static let maxRecentTranscriptions = 20
+    private static let previewLength = 60
+
     override init() {
         super.init()
         statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "whisper-keyboard")
@@ -188,6 +198,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                     state = .idle
                     return
                 }
+                // Record after (not before) attempting insertion, and only the cheap array
+                // bookkeeping here — rebuilding the menu's NSMenuItems is deferred to
+                // menuWillOpen so it never adds latency to the actual paste. `defer` still
+                // runs this even if insert() throws below, so a failed/lost paste is caught.
+                defer { recordTranscription(result.text) }
                 try TextInserter.insert(result.text)
                 state = .idle
             } catch InputInjectionKit.TextInserter.InsertionError.notTrusted {
@@ -198,6 +213,43 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
+    // MARK: - Recent transcriptions
+
+    private func recordTranscription(_ text: String) {
+        recentTranscriptions.insert(text, at: 0)
+        if recentTranscriptions.count > Self.maxRecentTranscriptions {
+            recentTranscriptions.removeLast(recentTranscriptions.count - Self.maxRecentTranscriptions)
+        }
+        // Menu rebuild deliberately not done here — see the call site in transcribe().
+    }
+
+    private func rebuildRecentTranscriptionsMenu() {
+        let recentMenu = NSMenu()
+        if recentTranscriptions.isEmpty {
+            let emptyItem = NSMenuItem(title: "No recent transcriptions", action: nil, keyEquivalent: "")
+            emptyItem.isEnabled = false
+            recentMenu.addItem(emptyItem)
+        } else {
+            for (index, text) in recentTranscriptions.enumerated() {
+                let item = NSMenuItem(title: Self.preview(of: text), action: #selector(copyRecentTranscription(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = index
+                item.toolTip = text
+                recentMenu.addItem(item)
+            }
+            recentMenu.addItem(.separator())
+            let clearItem = NSMenuItem(title: "Clear Recent Transcriptions", action: #selector(clearRecentTranscriptions), keyEquivalent: "")
+            clearItem.target = self
+            recentMenu.addItem(clearItem)
+        }
+        recentTranscriptionsParent.submenu = recentMenu
+    }
+
+    private static func preview(of text: String) -> String {
+        let collapsed = text.replacingOccurrences(of: "\n", with: " ")
+        return collapsed.count > previewLength ? String(collapsed.prefix(previewLength)) + "…" : collapsed
+    }
+
     // MARK: - Menu
 
     private func buildMenu() {
@@ -205,6 +257,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         statusLineItem.isEnabled = false
         menu.addItem(statusLineItem)
+        menu.addItem(.separator())
+
+        menu.addItem(recentTranscriptionsParent)
+        rebuildRecentTranscriptionsMenu()
         menu.addItem(.separator())
 
         let hotkeyItem = NSMenuItem(title: "Change Hotkey…", action: #selector(openSettings), keyEquivalent: "")
@@ -260,6 +316,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // Settings while the app is running), so re-check on every menu open rather than
         // only on dictation-state transitions.
         refresh()
+        rebuildRecentTranscriptionsMenu()
     }
 
     private func refresh() {
@@ -286,6 +343,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         for (hint, item) in languageItems {
             item.state = (hint == settings.languageHint) ? .on : .off
+            let isSupported = hint == .auto || hint == .english || settings.modelVariant.isMultilingual
+            item.isEnabled = isSupported
+            item.toolTip = isSupported ? nil : "\(settings.modelVariant.displayName) is English-only"
         }
         for (variant, item) in modelItems {
             item.state = (variant == settings.modelVariant) ? .on : .off
@@ -327,6 +387,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func selectModel(_ sender: NSMenuItem) {
         guard let variant = sender.representedObject as? WhisperModelVariant else { return }
         settings.modelVariant = variant
+        // Arabic only makes sense for a multilingual model — switching to an English-only
+        // one while it's selected would silently force a language token that model can't
+        // decode, so fall back to English rather than leave that stale combination in place.
+        if !variant.isMultilingual && settings.languageHint == .arabic {
+            settings.languageHint = .english
+        }
         refresh()
         Task {
             if await !ModelManager.shared.isDownloaded(variant) {
@@ -337,6 +403,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func downloadCurrentModel() {
         downloadAndLoad(settings.modelVariant)
+    }
+
+    @objc private func copyRecentTranscription(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int, recentTranscriptions.indices.contains(index) else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(recentTranscriptions[index], forType: .string)
+    }
+
+    @objc private func clearRecentTranscriptions() {
+        recentTranscriptions.removeAll()
+        rebuildRecentTranscriptionsMenu()
     }
 
     @objc private func toggleLaunchAtLogin() {
