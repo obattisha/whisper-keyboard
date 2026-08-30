@@ -3,9 +3,43 @@
 Local, offline dictation for macOS and iOS. On the Mac, hold a hotkey, speak (English or
 Arabic), release — the transcribed text is inserted at your cursor. Runs OpenAI's Whisper
 entirely on-device via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) with Metal
-acceleration — no cloud API, no subscription. Defaults to the Q5-quantized `large-v3-turbo`
-(574MB, multilingual, fastest to download and run); switch to the full `large-v3-turbo` or
-the faster-but-English-only `distil-large-v3` from the menu bar's Model menu.
+acceleration — no cloud API, no subscription, and no audio ever leaves the machine.
+
+The menu bar icon shows live status (Idle / Recording… / Transcribing…) and a **Recent
+Transcriptions** list — every transcription is kept there (in memory only, never written to
+disk) before insertion is even attempted, so a dictation that lands nowhere because no text
+field was focused is still one click away to copy, not lost.
+
+## Models
+
+Pick from the menu bar's **Model** submenu at any time — selecting a variant that isn't
+downloaded yet starts downloading it automatically (shown as "Downloading model… N%"), and
+each entry is labeled "(not downloaded)" until it's on disk so you can see what's actually
+available without leaving the menu.
+
+| Variant | Size | Speed | Languages |
+| --- | --- | --- | --- |
+| `large-v3-turbo-q5_0` (Q5) — **default** | 574 MB | fastest to download; fast to run | multilingual |
+| `large-v3-turbo` | 1.6 GB | slower to run than Q5 | multilingual, best quality |
+| `distil-large-v3` | 1.5 GB | ~5x faster than `large-v3-turbo` (~0.8% WER cost on long-form audio) | **English-only** |
+
+Q5 is the default for fresh installs (smallest download, fastest, still multilingual) — an
+existing explicit choice in Settings is never overridden. iOS always uses Q5 specifically,
+independent of this default, since phone storage/RAM is more constrained than a Mac.
+
+**Language detection**: the menu bar's **Language** submenu (Auto-detect / English / Arabic)
+isn't cosmetic — it's passed straight into whisper.cpp's decoding step, forcing that language
+and skipping Whisper's own auto-detection, which is noticeably less reliable on the short
+clips a hold-to-talk hotkey produces. Arabic is disabled (with an explanatory tooltip)
+whenever an English-only model like `distil-large-v3` is selected, and switching to one while
+Arabic is active falls back to English automatically.
+
+`ModelManager` pins an expected SHA-256 for each model file (`Types.swift`) and refuses to
+use a download that doesn't match. `large-v3-turbo`/`large-v3-turbo-q5_0` are verified
+against the Git LFS OIDs from https://huggingface.co/ggerganov/whisper.cpp;
+`distil-large-v3` against https://huggingface.co/distil-whisper/distil-large-v3-ggml, its own
+separate repo. If either ever ships new model files upstream, `Scripts/fetch-model.sh` prints
+the actual hash of what it downloads so you can re-pin them.
 
 ## Architecture
 
@@ -100,14 +134,6 @@ This is a first pass, not feature parity with the macOS app: the Action Button o
 fixed-trigger-fires third-party actions (no true continuous hold-to-record the way physical
 hotkeys or Apple's own Camera/Voice Memo actions get), and delivery is clipboard-paste
 rather than seamless cursor insertion.
-
-## Model verification
-
-`ModelManager` pins an expected SHA-256 for each model file (`Types.swift`) and refuses to
-use a download that doesn't match — verified against the Git LFS OIDs from
-https://huggingface.co/ggerganov/whisper.cpp. If whisper.cpp ever ships new model files
-upstream, `Scripts/fetch-model.sh` prints the actual hash of what it downloads so you can
-re-pin them.
 
 ## Development
 
