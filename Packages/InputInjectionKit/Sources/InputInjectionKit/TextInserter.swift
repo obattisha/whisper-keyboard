@@ -70,9 +70,19 @@ public enum TextInserter {
 
     private static func insertViaPasteboard(_ text: String) {
         let pasteboard = NSPasteboard.general
-        let savedItems = pasteboard.pasteboardItems?.compactMap { item -> (String, Data)? in
-            guard let type = item.types.first, let data = item.data(forType: type) else { return nil }
-            return (type.rawValue, data)
+        // Every flavor of every item, not just `types.first`. A single clipboard item
+        // routinely carries several representations at once (copying from a browser gives
+        // public.html, public.png and public.utf8-plain-text together), and keeping only
+        // the first one meant this "restore" quietly destroyed the rest of the user's
+        // clipboard on every dictation that fell back to pasting.
+        let savedItems: [[String: Data]] = pasteboard.pasteboardItems?.map { item in
+            var flavors: [String: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    flavors[type.rawValue] = data
+                }
+            }
+            return flavors
         } ?? []
 
         pasteboard.clearContents()
@@ -88,8 +98,16 @@ public enum TextInserter {
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             pasteboard.clearContents()
-            for (typeRaw, data) in savedItems {
-                pasteboard.setData(data, forType: NSPasteboard.PasteboardType(typeRaw))
+            let restored = savedItems.compactMap { flavors -> NSPasteboardItem? in
+                guard !flavors.isEmpty else { return nil }
+                let item = NSPasteboardItem()
+                for (typeRaw, data) in flavors {
+                    item.setData(data, forType: NSPasteboard.PasteboardType(typeRaw))
+                }
+                return item
+            }
+            if !restored.isEmpty {
+                pasteboard.writeObjects(restored)
             }
         }
     }

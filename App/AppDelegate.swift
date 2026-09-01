@@ -23,4 +23,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
+
+    /// whisper.cpp's Metal backend asserts at process exit that every Metal resource has
+    /// already been handed back, and nothing released the model context before `exit()` ran
+    /// that check, so every quit produced `Abort trap: 6` and a crash report. AppKit calls
+    /// this before exiting, which is the last moment the release can still happen.
+    func applicationWillTerminate(_ notification: Notification) {
+        statusItemController?.shutdown()
+    }
 }

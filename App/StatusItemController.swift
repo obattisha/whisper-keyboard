@@ -49,6 +49,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private static let maxRecentTranscriptions = 20
     private static let previewLength = 60
 
+    /// Which variants are on disk. Cached rather than probed on demand: `refresh()` runs on
+    /// every state change, and during a download that is once per progress callback, so the
+    /// old `Task { await ModelManager.shared.isDownloaded(...) }` per menu item per refresh
+    /// meant hundreds of filesystem hits a second for a set that changes maybe twice a day.
+    private var downloadedVariants: Set<WhisperModelVariant> = []
+    /// Set for the whole of a load, unlike the `.loadingModel` state, which is only reached
+    /// after two awaits. Two calls arriving in that window (app launch plus onboarding's
+    /// completion callback) both used to pass the guard and load the model twice.
+    private var isLoadingModel = false
+    private var errorClearTask: Task<Void, Never>?
+
     override init() {
         super.init()
         statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "whisper-keyboard")
@@ -63,6 +74,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             logger.notice("hotkey keyUp fired")
             self?.endRecordingAndTranscribe()
         }
+
+        Task { [weak self] in await self?.refreshDownloadedVariants() }
 
         NotificationCenter.default.addObserver(
             forName: AppSettings.modelVariantDidChange, object: nil, queue: .main
@@ -79,16 +92,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// If it isn't, onboarding is responsible for downloading it first — this just covers
     /// normal app launches after setup is complete.
     func loadModelIfAvailable() {
-        guard case .loadingModel = state else {
-            startLoadingModel()
-            return
-        }
         // Already loading (e.g. called again from onboarding's completion callback right
-        // after the app-launch call already started one) — let that one finish.
+        // after the app-launch call already started one), so let that one finish.
+        guard !isLoadingModel else { return }
+        startLoadingModel()
     }
 
     private func startLoadingModel() {
+        isLoadingModel = true
         Task {
+            defer { isLoadingModel = false }
             let variant = settings.modelVariant
             guard await ModelManager.shared.isDownloaded(variant) else {
                 logger.notice("loadModelIfAvailable: \(variant.rawValue, privacy: .public) not downloaded yet, skipping")
@@ -109,7 +122,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 logger.notice("loadModelIfAvailable: model loaded successfully")
             } catch {
                 logger.error("loadModelIfAvailable: failed to load model: \(String(describing: error), privacy: .public)")
-                state = .error("Failed to load model")
+                setError("Failed to load model")
             }
         }
     }
@@ -132,10 +145,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 }
             } catch {
                 logger.error("downloadAndLoad: download failed: \(String(describing: error), privacy: .public)")
-                state = .error("Model download failed")
+                setError("Model download failed")
                 return
             }
             state = .idle
+            await refreshDownloadedVariants()
             loadModelIfAvailable()
         }
     }
@@ -144,9 +158,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func beginRecording() {
         logger.notice("beginRecording: state=\(String(describing: self.state), privacy: .public) engineLoaded=\(self.engine != nil, privacy: .public)")
-        guard case .idle = state else { return }
+        switch state {
+        case .idle:
+            break
+        case .error:
+            // The single worst bug in this file: `guard case .idle` meant one failed attempt
+            // (a mic glitch, a transcription error, a missing permission) left the hotkey a
+            // silent no-op until the app was relaunched, because nothing ever moved the
+            // state back out of `.error`. A new press is exactly the moment to clear it.
+            errorClearTask?.cancel()
+            state = .idle
+        case .recording, .transcribing, .downloadingModel, .loadingModel:
+            return
+        }
+
         guard engine != nil else {
-            state = .error("Model not loaded")
+            setError("Model not loaded")
             return
         }
 
@@ -160,7 +187,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 if granted {
                     startRecordingNow()
                 } else {
-                    state = .error("Microphone permission denied")
+                    setError("Microphone permission denied")
                 }
             }
             return
@@ -174,14 +201,21 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             try recorder.start()
             state = .recording
         } catch {
+            // `error` interpolated directly used to put a raw CoreAudio dump in the menu
+            // bar. AudioRecorderError is a LocalizedError now, so this is a readable line.
             logger.error("startRecordingNow: recorder.start() failed: \(String(describing: error), privacy: .public)")
-            state = .error("Mic error: \(error)")
+            setError(error.localizedDescription)
         }
     }
 
     private func endRecordingAndTranscribe() {
         guard case .recording = state else { return }
         guard let samples = recorder.stopAndCapture() else {
+            // Nothing to transcribe: either the hold was under AudioRecorder's minimum
+            // duration, or no buffers arrived. Both used to return here silently, which
+            // made a dropped utterance indistinguishable from one that was never spoken —
+            // worth a log line, since there is no UI signal for it either.
+            logger.notice("endRecordingAndTranscribe: no samples captured, dropping utterance")
             state = .idle
             return
         }
@@ -189,7 +223,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         Task {
             guard let engine else {
-                state = .error("Model not loaded")
+                setError("Model not loaded")
                 return
             }
             do {
@@ -206,11 +240,42 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 try TextInserter.insert(result.text)
                 state = .idle
             } catch InputInjectionKit.TextInserter.InsertionError.notTrusted {
-                state = .error("Accessibility permission needed")
+                setError("Accessibility permission needed")
             } catch {
-                state = .error("Transcription failed")
+                logger.error("transcribe failed: \(String(describing: error), privacy: .public)")
+                setError("Transcription failed")
             }
         }
+    }
+
+    // MARK: - Errors
+
+    /// Shows `message` in the menu bar and schedules it to fade back to Idle.
+    ///
+    /// Errors are otherwise permanent: nothing else in the app clears one, so the menu bar
+    /// kept a warning triangle indefinitely for a failure the user had already worked
+    /// around. `beginRecording()` also clears the state directly, so this timer is only
+    /// about the display, not about whether the hotkey works.
+    private func setError(_ message: String) {
+        state = .error(message)
+        errorClearTask?.cancel()
+        errorClearTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 8 * NSEC_PER_SEC)
+            guard !Task.isCancelled, let self else { return }
+            if case .error = self.state {
+                self.state = .idle
+            }
+        }
+    }
+
+    // MARK: - Teardown
+
+    /// Releases the whisper context while the app is still alive. See
+    /// `WhisperEngine.shutdown()` for why quitting crashed without this.
+    func shutdown() {
+        errorClearTask?.cancel()
+        engine?.shutdown()
+        engine = nil
     }
 
     // MARK: - Recent transcriptions
@@ -225,6 +290,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func rebuildRecentTranscriptionsMenu() {
         let recentMenu = NSMenu()
+        recentMenu.autoenablesItems = false
         if recentTranscriptions.isEmpty {
             let emptyItem = NSMenuItem(title: "No recent transcriptions", action: nil, keyEquivalent: "")
             emptyItem.isEnabled = false
@@ -254,6 +320,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func buildMenu() {
         let menu = NSMenu()
+        // NSMenu enables items automatically by default, which silently overrode every
+        // `item.isEnabled = false` below. That is why the Arabic entry stayed clickable
+        // under an English-only model despite the code that was meant to disable it.
+        menu.autoenablesItems = false
 
         statusLineItem.isEnabled = false
         menu.addItem(statusLineItem)
@@ -268,6 +338,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(hotkeyItem)
 
         let languageMenu = NSMenu()
+        languageMenu.autoenablesItems = false
         for hint in LanguageHint.allCases {
             let item = NSMenuItem(title: hint.menuTitle, action: #selector(selectLanguage(_:)), keyEquivalent: "")
             item.target = self
@@ -280,6 +351,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(languageParent)
 
         let modelMenu = NSMenu()
+        modelMenu.autoenablesItems = false
         for variant in WhisperModelVariant.allCases {
             let item = NSMenuItem(title: variant.displayName, action: #selector(selectModel(_:)), keyEquivalent: "")
             item.target = self
@@ -317,6 +389,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         // only on dictation-state transitions.
         refresh()
         rebuildRecentTranscriptionsMenu()
+        Task { [weak self] in await self?.refreshDownloadedVariants() }
     }
 
     private func refresh() {
@@ -349,10 +422,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         for (variant, item) in modelItems {
             item.state = (variant == settings.modelVariant) ? .on : .off
-            Task {
-                let isDownloaded = await ModelManager.shared.isDownloaded(variant)
-                item.title = isDownloaded ? variant.displayName : "\(variant.displayName) (not downloaded)"
-            }
+            item.title = downloadedVariants.contains(variant)
+                ? variant.displayName
+                : "\(variant.displayName) (not downloaded)"
         }
         launchAtLoginItem.state = settings.launchAtLogin ? .on : .off
         accessibilityItem.isHidden = TextInserter.isAccessibilityTrusted
@@ -367,13 +439,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         default:
             downloadModelItem.isHidden = engine != nil
             if engine == nil {
-                let variant = settings.modelVariant
-                Task {
-                    let isDownloaded = await ModelManager.shared.isDownloaded(variant)
-                    downloadModelItem.title = isDownloaded ? "Load Model…" : "Download Model…"
-                }
+                downloadModelItem.title = downloadedVariants.contains(settings.modelVariant)
+                    ? "Load Model…"
+                    : "Download Model…"
             }
         }
+    }
+
+    private func refreshDownloadedVariants() async {
+        var found: Set<WhisperModelVariant> = []
+        for variant in WhisperModelVariant.allCases where await ModelManager.shared.isDownloaded(variant) {
+            found.insert(variant)
+        }
+        downloadedVariants = found
+        refresh()
     }
 
     // MARK: - Actions
@@ -395,7 +474,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         refresh()
         Task {
-            if await !ModelManager.shared.isDownloaded(variant) {
+            await refreshDownloadedVariants()
+            if !downloadedVariants.contains(variant) {
                 downloadAndLoad(variant)
             }
         }

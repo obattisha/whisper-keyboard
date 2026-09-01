@@ -88,7 +88,16 @@ final class DictationCoordinator: ObservableObject {
     /// Start button and `DictateIntent.perform()`.
     @discardableResult
     func beginDictation() async -> String? {
-        guard case .idle = state else { return nil }
+        switch state {
+        case .idle:
+            break
+        case .error:
+            // Same trap the macOS hotkey had: without this, one failed attempt left every
+            // later tap a no-op, because nothing moved the state back out of `.error`.
+            state = .idle
+        case .recording, .transcribing:
+            return nil
+        }
         guard isModelReady else {
             state = .error("Model not downloaded")
             return nil
@@ -97,7 +106,7 @@ final class DictationCoordinator: ObservableObject {
         do {
             try recorder.start()
         } catch {
-            state = .error("Mic error: \(error.localizedDescription)")
+            state = .error(error.localizedDescription)
             return nil
         }
         state = .recording
