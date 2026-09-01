@@ -1,8 +1,5 @@
 import Foundation
-import os
 import whisper
-
-private let logger = Logger(subsystem: "com.omar.whisperkeyboard", category: "transcription")
 
 /// Serialized wrapper over the whisper.cpp C API.
 ///
@@ -19,20 +16,6 @@ public final class WhisperEngine: @unchecked Sendable {
     private let queue = DispatchQueue(label: "com.omar.whisperkeyboard.whisper", qos: .userInitiated)
     private var context: OpaquePointer?
     private let modelPath: String
-
-    /// Below this RMS the clip is treated as silence and never reaches the model.
-    ///
-    /// Whisper's training data is full of video transcripts, so near-silence decodes to the
-    /// most likely thing such a clip would have carried: "Thank you", "Thanks for watching".
-    /// It is a confident, well-formed hallucination, which is what makes it worth catching
-    /// rather than tolerating. Speech sits around 0.03 RMS and up even when quiet; a room's
-    /// noise floor is nearer 0.001, so this sits well clear of both.
-    private static let silenceRMSThreshold: Float = 0.002
-    private static let silencePeakThreshold: Float = 0.02
-
-    /// Segments the model itself scores as more likely silence than speech are dropped. The
-    /// same threshold OpenAI's reference decoder uses.
-    private static let noSpeechThreshold: Float = 0.6
 
     public init(modelPath: String) {
         self.modelPath = modelPath
@@ -98,29 +81,10 @@ public final class WhisperEngine: @unchecked Sendable {
         }
     }
 
-    private static func level(of samples: [Float]) -> (rms: Float, peak: Float)? {
-        guard !samples.isEmpty else { return nil }
-        var sumOfSquares: Float = 0
-        var peak: Float = 0
-        for sample in samples {
-            sumOfSquares += sample * sample
-            peak = max(peak, abs(sample))
-        }
-        return (rms: (sumOfSquares / Float(samples.count)).squareRoot(), peak: peak)
-    }
-
     /// Must only be called on `queue`.
     private func run(samples: [Float], languageHint: LanguageHint) throws -> TranscriptionResult {
         guard let context else {
             throw TranscriptionError.modelNotLoaded
-        }
-
-        // Cheap energy gate first. Besides suppressing the hallucination, this skips a
-        // second of pointless inference on a hold that captured nothing.
-        if let level = Self.level(of: samples),
-           level.rms < Self.silenceRMSThreshold, level.peak < Self.silencePeakThreshold {
-            logger.notice("clip is silent (rms \(level.rms, privacy: .public)), skipping transcription")
-            return TranscriptionResult(text: "", detectedLanguage: nil)
         }
 
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
@@ -159,14 +123,6 @@ public final class WhisperEngine: @unchecked Sendable {
         var text = ""
         let segmentCount = whisper_full_n_segments(context)
         for i in 0..<segmentCount {
-            // The model's own estimate that this segment is silence rather than speech.
-            // Preferred over matching known hallucinated phrases, which would also throw
-            // away a genuine "thank you".
-            let noSpeechProbability = whisper_full_get_segment_no_speech_prob(context, i)
-            guard noSpeechProbability < Self.noSpeechThreshold else {
-                logger.notice("dropping segment scored as silence (p \(noSpeechProbability, privacy: .public))")
-                continue
-            }
             text += String(cString: whisper_full_get_segment_text(context, i))
         }
 
