@@ -6,6 +6,8 @@
 @preconcurrency import AVFoundation
 import os
 
+private let logger = Logger(subsystem: "com.omar.whisperkeyboard", category: "audio")
+
 public enum AudioRecorderError: Error, LocalizedError {
     case microphonePermissionDenied
     case inputUnavailable(underlying: Error)
@@ -142,6 +144,7 @@ public final class AudioRecorder {
     private var engine = AVAudioEngine()
     private var utterance: UtteranceBuffer?
     private var configChangeObserver: NSObjectProtocol?
+    private var restartTask: Task<Void, Never>?
     private var recordingStartedAt: Date?
 
     public init() {}
@@ -174,6 +177,9 @@ public final class AudioRecorder {
             throw AudioRecorderError.inputUnavailable(underlying: error)
         }
         #endif
+
+        restartTask?.cancel()
+        restartTask = nil
 
         let buffer = UtteranceBuffer(targetFormat: targetFormat)
         utterance = buffer
@@ -212,26 +218,73 @@ public final class AudioRecorder {
 
         installTap(feeding: buffer)
 
-        // Bluetooth headphones commonly switch profile the instant the mic is engaged, from
-        // A2DP (output-only) to a headset mode that can carry input too, often at a
-        // different rate (8kHz, 16kHz or 24kHz, mono). That switch is asynchronous and can
-        // still be mid-flight when we reach installTap above, or can land after recording
-        // has already begun. Either way the hardware format changes out from under us, and
-        // this notification is how the engine reports it so we can reinstall the tap
-        // against whatever the format now actually is.
+        // Bluetooth headphones switch profile the instant the mic is engaged, from A2DP
+        // (output-only) to a headset mode that can carry input too, at a different rate
+        // (8kHz, 16kHz or 24kHz, mono). That switch lands a couple of hundred milliseconds
+        // into the hold, and this notification is how the engine reports it.
         configChangeObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
             queue: nil
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, let current = self.utterance else { return }
-                self.installTap(feeding: current)
+                self?.handleConfigurationChange()
             }
         }
 
         engine.prepare()
         try engine.start()
+    }
+
+    /// AVAudioEngine does not merely report a hardware format change, it *stops itself* in
+    /// response to one. Reinstalling the tap is therefore not enough on its own: without an
+    /// explicit restart the engine sat stopped for the remainder of every hold, which is
+    /// what made dictation through Bluetooth headphones capture nothing at all.
+    ///
+    ///     Engine@0x...: start, was running 0      <- hold begins
+    ///     Engine@0x...: stop,  was running 1      <- 215ms later, the profile switch
+    ///     (silence for the rest of the hold)
+    private func handleConfigurationChange() {
+        guard let buffer = utterance else { return } // not recording; nothing to preserve
+        if engine.isRunning {
+            // Format moved but the engine survived it. The tap still has to be reinstalled
+            // so that `format: nil` re-resolves against what the hardware is now doing.
+            logger.notice("configuration changed while running, reinstalling tap")
+            installTap(feeding: buffer)
+            return
+        }
+        logger.notice("configuration changed and engine stopped, restarting")
+        scheduleRestart(feeding: buffer)
+    }
+
+    /// Brings the engine back up against the device's new format, retrying briefly.
+    ///
+    /// The device is still renegotiating when the notification arrives (CoreAudio logs a
+    /// burst of -10877 "channel layout" errors right through the switch), so an immediate
+    /// start() can legitimately fail. Backing off and retrying recovers the rest of the
+    /// hold instead of abandoning it. The samples already captured are kept: `buffer`
+    /// outlives the engine, so audio from before and after the switch both land in the
+    /// same utterance.
+    private func scheduleRestart(feeding buffer: UtteranceBuffer) {
+        restartTask?.cancel()
+        restartTask = Task { @MainActor [weak self] in
+            for delayMilliseconds in [0, 120, 300, 600] {
+                if delayMilliseconds > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(delayMilliseconds) * NSEC_PER_MSEC)
+                }
+                // Bail out if the hold ended, or a later utterance already took over.
+                guard !Task.isCancelled, let self, self.utterance === buffer else { return }
+                if self.engine.isRunning { return }
+                do {
+                    try self.startEngine(feeding: buffer)
+                    logger.notice("engine restarted after configuration change")
+                    return
+                } catch {
+                    logger.error("restart attempt failed: \(String(describing: error), privacy: .public)")
+                }
+            }
+            logger.error("gave up restarting the engine after a configuration change")
+        }
     }
 
     /// (Re)installs the tap against the input node's *current* native format. Deliberately
@@ -258,6 +311,8 @@ public final class AudioRecorder {
     /// Stops capturing and returns the accumulated samples, or nil if the hold was too
     /// short to be a real utterance or produced no audio at all.
     public func stopAndCapture() -> [Float]? {
+        restartTask?.cancel()
+        restartTask = nil
         removeConfigChangeObserver()
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
