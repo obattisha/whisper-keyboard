@@ -14,6 +14,10 @@ extension KeyboardShortcuts.Name {
 
 private enum DictationState {
     case idle
+    /// The microphone has been asked to open but no audio has reached us yet. On a
+    /// Bluetooth headset that gap is most of a second, and showing "Recording" through it
+    /// is what invited speaking into an input that was not live, losing the first words.
+    case preparingMicrophone
     case recording
     case transcribing
     case downloadingModel(progress: Double)
@@ -65,6 +69,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "whisper-keyboard")
         buildMenu()
         refresh()
+
+        // Flipped from "Preparing microphone…" to "Recording…" by the first buffer that
+        // actually arrives, not by start() returning.
+        recorder.onCaptureBegan = { [weak self] in
+            guard let self, case .preparingMicrophone = self.state else { return }
+            self.state = .recording
+        }
 
         KeyboardShortcuts.onKeyDown(for: .pushToTalk) { [weak self] in
             logger.notice("hotkey keyDown fired")
@@ -168,7 +179,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             // state back out of `.error`. A new press is exactly the moment to clear it.
             errorClearTask?.cancel()
             state = .idle
-        case .recording, .transcribing, .downloadingModel, .loadingModel:
+        case .preparingMicrophone, .recording, .transcribing, .downloadingModel, .loadingModel:
             return
         }
 
@@ -199,7 +210,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func startRecordingNow() {
         do {
             try recorder.start()
-            state = .recording
+            state = .preparingMicrophone
         } catch {
             // `error` interpolated directly used to put a raw CoreAudio dump in the menu
             // bar. AudioRecorderError is a LocalizedError now, so this is a readable line.
@@ -209,7 +220,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     private func endRecordingAndTranscribe() {
-        guard case .recording = state else { return }
+        switch state {
+        case .preparingMicrophone, .recording:
+            break
+        default:
+            return
+        }
         guard let samples = recorder.stopAndCapture() else {
             // Nothing to transcribe: either the hold was under AudioRecorder's minimum
             // duration, or no buffers arrived. Both used to return here silently, which
@@ -274,6 +290,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// `WhisperEngine.shutdown()` for why quitting crashed without this.
     func shutdown() {
         errorClearTask?.cancel()
+        // Closes the microphone, which may still be held open from a recent dictation.
+        recorder.teardown()
         engine?.shutdown()
         engine = nil
     }
@@ -397,6 +415,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         case .idle:
             statusLineItem.title = "Idle"
             statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: nil)
+        case .preparingMicrophone:
+            statusLineItem.title = "Preparing microphone…"
+            statusItem.button?.image = NSImage(systemSymbolName: "mic.badge.plus", accessibilityDescription: nil)
         case .recording:
             statusLineItem.title = "Recording…"
             statusItem.button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
