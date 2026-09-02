@@ -1,8 +1,7 @@
 // AVAudioConverter's input-supply closure is annotated @Sendable in the SDK but runs
 // synchronously inside convert(to:error:), so capturing the non-Sendable input buffer there
-// is safe. That, and only that, is what this @preconcurrency import covers. The tap block
-// in installTap() is deliberately not such a case: it runs on a realtime audio thread, so
-// nothing inside it touches main-actor state. See SampleStore.
+// is safe. That, and only that, is what this @preconcurrency import covers. Capture
+// callbacks below run on a realtime audio thread and deliberately touch no main-actor state.
 @preconcurrency import AVFoundation
 import CoreAudio
 import os
@@ -12,14 +11,19 @@ private let logger = Logger(subsystem: "com.omar.whisperkeyboard", category: "au
 public enum AudioRecorderError: Error, LocalizedError {
     case microphonePermissionDenied
     case inputUnavailable(underlying: Error)
+    case inputDeviceUnavailable
+    case coreAudio(status: OSStatus, operation: String)
 
     /// Deliberately short and human-readable: this string goes straight into the menu bar,
-    /// which used to show a raw CoreAudio dump ("Error Domain=com.apple.coreaudio.avfaudio
-    /// Code=-10868 (null) ... AUGraphParser::InitializeActiveNodesInInputChain").
+    /// which used to show a raw CoreAudio dump.
     public var errorDescription: String? {
         switch self {
         case .microphonePermissionDenied:
             return "Microphone permission denied"
+        case .inputDeviceUnavailable:
+            return "No microphone available"
+        case .coreAudio:
+            return "Microphone unavailable"
         case .inputUnavailable(let underlying):
             let isFormatMismatch = (underlying as NSError).code == -10868
             return isFormatMismatch
@@ -31,30 +35,37 @@ public enum AudioRecorderError: Error, LocalizedError {
 
 /// Sample storage shared between the audio thread and the main actor.
 ///
-/// A separate, non-isolated type because `AudioRecorder` is `@MainActor` and the tap block
-/// is not. Calling a main-actor method from the tap compiles (the module is imported
-/// `@preconcurrency`) but does not hop threads: it runs the body on the audio thread, racing
-/// the main thread's reads. That race silently dropped whole utterances.
-private final class SampleStore: @unchecked Sendable {
+/// A separate, non-isolated type because `AudioRecorder` is `@MainActor` and the capture
+/// callback is not. Calling a main-actor method from that callback compiles (the module is
+/// imported `@preconcurrency`) but does not hop threads: it runs the body on the audio
+/// thread, racing the main thread's reads. That race silently dropped whole utterances.
+final class SampleStore: @unchecked Sendable {
     private struct Storage {
         var samples: [Float] = []
-        /// Set by the audio thread the first time real audio lands. The UI waits for this
-        /// rather than for `engine.start()` returning, which is not the same moment.
         var hasReceivedAudio = false
+        var onFirstBuffer: (@Sendable () -> Void)?
     }
 
     private let storage = OSAllocatedUnfairLock<Storage>(initialState: Storage())
 
+    /// Called on the main queue the first time real audio lands, which is the only honest
+    /// signal that capture is live. Nothing polls for it.
+    func setFirstBufferHandler(_ handler: (@Sendable () -> Void)?) {
+        storage.withLock { $0.onFirstBuffer = handler }
+    }
+
     /// Audio thread.
     func append(_ frames: UnsafeBufferPointer<Float>) {
         guard !frames.isEmpty else { return }
-        storage.withLockUnchecked { state in
-            state.hasReceivedAudio = true
+        let notify: (@Sendable () -> Void)? = storage.withLockUnchecked { state in
             state.samples.append(contentsOf: frames)
+            guard !state.hasReceivedAudio else { return nil }
+            state.hasReceivedAudio = true
+            return state.onFirstBuffer
         }
+        // Dispatched outside the lock, and only ever once per recording.
+        if let notify { DispatchQueue.main.async(execute: notify) }
     }
-
-    var hasReceivedAudio: Bool { storage.withLock { $0.hasReceivedAudio } }
 
     func reset() {
         storage.withLock { state in
@@ -72,27 +83,387 @@ private final class SampleStore: @unchecked Sendable {
     }
 }
 
-/// Resamples tap buffers to whisper's format and hands them to the store. One instance per
-/// engine, so the converter fields are written only by that engine's tap thread.
-private final class TapConverter: @unchecked Sendable {
-    private let targetFormat: AVAudioFormat
-    private let store: SampleStore
-    private var converter: AVAudioConverter?
-    private var converterInputFormat: AVAudioFormat?
-    /// Cleared when the owning engine is retired, so a tap callback still in flight from an
-    /// engine we have already replaced cannot inject audio into the next recording.
-    private let active = OSAllocatedUnfairLock<Bool>(initialState: true)
+/// Identity of the current default input. A Bluetooth headset entering microphone mode
+/// changes its nominal sample rate, and may replace its streams more than once on the way,
+/// so this is how "still renegotiating" is told from "settled".
+struct InputDeviceState: Equatable {
+    var deviceID: AudioDeviceID
+    var sampleRate: Double
 
-    init(targetFormat: AVAudioFormat, store: SampleStore) {
-        self.targetFormat = targetFormat
-        self.store = store
+    static func current() -> InputDeviceState? {
+        guard let deviceID = defaultInputDeviceID() else { return nil }
+        var sampleRate = Double(0)
+        var size = UInt32(MemoryLayout<Double>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &sampleRate) == noErr,
+              sampleRate > 0 else { return nil }
+        return InputDeviceState(deviceID: deviceID, sampleRate: sampleRate)
     }
 
-    func retire() { active.withLock { $0 = false } }
+    static func defaultInputDeviceID() -> AudioDeviceID? {
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID
+        ) == noErr, deviceID != kAudioObjectUnknown else { return nil }
+        return deviceID
+    }
+}
 
-    func consume(buffer: AVAudioPCMBuffer) {
+#if os(macOS)
+
+/// Input-only capture through an AUHAL audio unit bound to a specific device.
+///
+/// Replaces `AVAudioEngine` on macOS for one reason: `AVAudioEngine.inputNode` silently
+/// stands up an aggregate device with *both* an input and an output stream, even for an app
+/// that never plays anything. The logs showed it configuring a 2ch 24kHz output render
+/// format on a pair of headphones we only ever recorded from. That phantom output is what
+/// drags AirPods into call quality even when an app is recording from an entirely different
+/// microphone, and it gave the device more to renegotiate during the Bluetooth profile
+/// switch than it needed.
+///
+/// AUHAL with output disabled opens exactly one stream on exactly one device. It also takes
+/// the client format directly, so the 16kHz mono conversion whisper needs happens inside
+/// CoreAudio rather than in an AVAudioConverter we drive ourselves, and there is no cached
+/// engine-side format to go stale (the -10868 loop).
+private final class AUHALCapture: @unchecked Sendable {
+    private var unit: AudioUnit?
+    private let store: SampleStore
+    /// Cleared before teardown so a callback still in flight cannot touch freed buffers.
+    private let active = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+    /// Preallocated: the render callback must not allocate.
+    private static let maximumFramesPerSlice: UInt32 = 4096
+    private static let frameCapacity: AVAudioFrameCount = 16_384
+    private var bufferList: UnsafeMutableAudioBufferListPointer
+    private let targetFormat: AVAudioFormat
+    /// Hardware-rate mono, rendered into directly by the callback.
+    private var hardwareBuffer: AVAudioPCMBuffer?
+    /// 16kHz mono, the format whisper wants.
+    private var resampledBuffer: AVAudioPCMBuffer?
+    private var converter: AVAudioConverter?
+    private var loggedRenderFailure = false
+
+    init(store: SampleStore, targetFormat: AVAudioFormat) {
+        self.store = store
+        self.targetFormat = targetFormat
+        bufferList = AudioBufferList.allocate(maximumBuffers: 1)
+    }
+
+    deinit {
+        free(bufferList.unsafeMutablePointer)
+    }
+
+    func open(deviceID: AudioDeviceID) throws {
+        close()
+
+        var description = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+        guard let component = AudioComponentFindNext(nil, &description) else {
+            throw AudioRecorderError.inputDeviceUnavailable
+        }
+
+        var newUnit: AudioUnit?
+        try check(AudioComponentInstanceNew(component, &newUnit), "AudioComponentInstanceNew")
+        guard let newUnit else { throw AudioRecorderError.inputDeviceUnavailable }
+        unit = newUnit
+
+        // Input on, output off. The second half is the entire point of this class.
+        var enable: UInt32 = 1
+        try check(AudioUnitSetProperty(
+            newUnit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1,
+            &enable, UInt32(MemoryLayout<UInt32>.size)
+        ), "EnableIO(input)")
+
+        var disable: UInt32 = 0
+        try check(AudioUnitSetProperty(
+            newUnit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0,
+            &disable, UInt32(MemoryLayout<UInt32>.size)
+        ), "EnableIO(output)")
+
+        // Bound explicitly, rather than following whatever the system default becomes.
+        var device = deviceID
+        try check(AudioUnitSetProperty(
+            newUnit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+            &device, UInt32(MemoryLayout<AudioDeviceID>.size)
+        ), "CurrentDevice")
+
+        var maximumFrames = Self.maximumFramesPerSlice
+        try check(AudioUnitSetProperty(
+            newUnit, kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0,
+            &maximumFrames, UInt32(MemoryLayout<UInt32>.size)
+        ), "MaximumFramesPerSlice")
+
+        // Ask the hardware what rate it is actually running at, and take exactly that.
+        //
+        // Setting 16kHz here instead, and letting AUHAL resample, is what broke the first
+        // attempt at this: its input element does not reliably sample-rate convert, and
+        // `inNumberFrames` in the callback counts *hardware* frames, so AudioUnitRender was
+        // being handed a frame count in one rate and a buffer in another. It failed
+        // silently and every hold captured nothing. Match the hardware, resample below.
+        var hardwareFormat = AudioStreamBasicDescription()
+        var hardwareFormatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        try check(AudioUnitGetProperty(
+            newUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1,
+            &hardwareFormat, &hardwareFormatSize
+        ), "StreamFormat(hardware)")
+
+        let hardwareSampleRate = hardwareFormat.mSampleRate > 0
+            ? hardwareFormat.mSampleRate
+            : AudioRecorder.whisperSampleRate
+
+        var clientFormat = AudioStreamBasicDescription(
+            mSampleRate: hardwareSampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        try check(AudioUnitSetProperty(
+            newUnit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1,
+            &clientFormat, UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        ), "StreamFormat")
+
+        guard let captureFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: hardwareSampleRate,
+            channels: 1, interleaved: false
+        ),
+        let hardwareBuffer = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: Self.frameCapacity),
+        let resampledBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: Self.frameCapacity),
+        let converter = AVAudioConverter(from: captureFormat, to: targetFormat) else {
+            throw AudioRecorderError.inputDeviceUnavailable
+        }
+        self.hardwareBuffer = hardwareBuffer
+        self.resampledBuffer = resampledBuffer
+        self.converter = converter
+        loggedRenderFailure = false
+        logger.notice("capture opened at \(hardwareSampleRate, privacy: .public) Hz, resampling to 16000")
+
+        var callback = AURenderCallbackStruct(
+            inputProc: auhalInputCallback,
+            inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
+        )
+        try check(AudioUnitSetProperty(
+            newUnit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0,
+            &callback, UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+        ), "SetInputCallback")
+
+        try check(AudioUnitInitialize(newUnit), "AudioUnitInitialize")
+        active.withLock { $0 = true }
+        do {
+            try check(AudioOutputUnitStart(newUnit), "AudioOutputUnitStart")
+        } catch {
+            active.withLock { $0 = false }
+            throw error
+        }
+    }
+
+    func close() {
+        // Order matters: stop the callback from doing anything, then stop IO (which waits
+        // for an in-flight callback to return), then tear the unit down.
+        active.withLock { $0 = false }
+        if let unit {
+            AudioOutputUnitStop(unit)
+            AudioUnitUninitialize(unit)
+            AudioComponentInstanceDispose(unit)
+        }
+        unit = nil
+        hardwareBuffer = nil
+        resampledBuffer = nil
+        converter = nil
+    }
+
+    /// Audio thread.
+    fileprivate func render(
+        flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+        timestamp: UnsafePointer<AudioTimeStamp>,
+        bus: UInt32,
+        frames: UInt32
+    ) -> OSStatus {
+        guard active.withLock({ $0 }), let unit,
+              let hardwareBuffer, let resampledBuffer, let converter else { return noErr }
+        guard frames <= Self.frameCapacity, let hardwareChannels = hardwareBuffer.floatChannelData else {
+            return noErr
+        }
+
+        bufferList[0] = AudioBuffer(
+            mNumberChannels: 1,
+            mDataByteSize: frames * 4,
+            mData: UnsafeMutableRawPointer(hardwareChannels[0])
+        )
+
+        let status = AudioUnitRender(unit, flags, timestamp, bus, frames, bufferList.unsafeMutablePointer)
+        guard status == noErr else {
+            // Logged once so a silent capture failure is visible without flooding the log
+            // from a realtime callback.
+            if !loggedRenderFailure {
+                loggedRenderFailure = true
+                logger.error("AudioUnitRender failed: \(status, privacy: .public)")
+            }
+            return status
+        }
+
+        hardwareBuffer.frameLength = frames
+        resampledBuffer.frameLength = 0
+
+        var supplied = false
+        let result = converter.convert(to: resampledBuffer, error: nil) { _, outStatus in
+            if supplied { outStatus.pointee = .noDataNow; return nil }
+            supplied = true
+            outStatus.pointee = .haveData
+            return hardwareBuffer
+        }
+        guard result != .error, let resampled = resampledBuffer.floatChannelData else { return noErr }
+
+        store.append(UnsafeBufferPointer(start: resampled[0], count: Int(resampledBuffer.frameLength)))
+        return noErr
+    }
+
+    private func check(_ status: OSStatus, _ operation: String) throws {
+        guard status != noErr else { return }
+        logger.error("\(operation, privacy: .public) failed: \(status, privacy: .public)")
+        throw AudioRecorderError.coreAudio(status: status, operation: operation)
+    }
+}
+
+/// Top-level so it is a plain C function pointer, which AURenderCallbackStruct requires.
+private func auhalInputCallback(
+    inRefCon: UnsafeMutableRawPointer,
+    ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+    inTimeStamp: UnsafePointer<AudioTimeStamp>,
+    inBusNumber: UInt32,
+    inNumberFrames: UInt32,
+    ioData: UnsafeMutablePointer<AudioBufferList>?
+) -> OSStatus {
+    Unmanaged<AUHALCapture>.fromOpaque(inRefCon).takeUnretainedValue()
+        .render(flags: ioActionFlags, timestamp: inTimeStamp, bus: inBusNumber, frames: inNumberFrames)
+}
+
+/// Watches CoreAudio for the events that actually invalidate a capture.
+///
+/// This replaces a supervisor that polled every 25ms and inferred trouble from timeouts:
+/// "no audio for 600ms means stalled", "1.5s is how long a cold Bluetooth open takes".
+/// Those numbers were guesses about someone else's hardware, and the tighter one was
+/// actively harmful, declaring a healthy-but-slow start dead and rebuilding on top of it.
+/// CoreAudio will say when the sample rate changes, when IO stops abnormally, when the
+/// streams are replaced, and when the default input moves. Waiting to be told costs nothing
+/// and is never wrong about timing.
+private final class DeviceChangeObserver {
+    private struct Registration {
+        var objectID: AudioObjectID
+        var address: AudioObjectPropertyAddress
+        var block: AudioObjectPropertyListenerBlock
+    }
+
+    private var registrations: [Registration] = []
+    private let queue = DispatchQueue(label: "com.omar.whisperkeyboard.device-events")
+
+    func observe(deviceID: AudioDeviceID, onChange: @escaping @Sendable (String, Bool) -> Void) {
+        stop()
+        // The Bool is whether the event alone justifies rebuilding. A rate or stream change
+        // is only interesting if it left us on something different from what we opened
+        // against; IO stopping abnormally is unconditional.
+        let targets: [(AudioObjectID, AudioObjectPropertySelector, AudioObjectPropertyScope, String, Bool)] = [
+            (AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultInputDevice,
+             kAudioObjectPropertyScopeGlobal, "default input device changed", false),
+            (deviceID, kAudioDevicePropertyNominalSampleRate,
+             kAudioObjectPropertyScopeGlobal, "nominal sample rate changed", false),
+            (deviceID, kAudioDevicePropertyStreamConfiguration,
+             kAudioDevicePropertyScopeInput, "input streams changed", false),
+            (deviceID, kAudioDevicePropertyIOStoppedAbnormally,
+             kAudioObjectPropertyScopeGlobal, "IO stopped abnormally", true),
+        ]
+
+        for (objectID, selector, scope, reason, forces) in targets {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain
+            )
+            let block: AudioObjectPropertyListenerBlock = { _, _ in onChange(reason, forces) }
+            guard AudioObjectAddPropertyListenerBlock(objectID, &address, queue, block) == noErr else {
+                continue
+            }
+            registrations.append(Registration(objectID: objectID, address: address, block: block))
+        }
+    }
+
+    func stop() {
+        for registration in registrations {
+            var address = registration.address
+            AudioObjectRemovePropertyListenerBlock(
+                registration.objectID, &address, queue, registration.block
+            )
+        }
+        registrations.removeAll()
+    }
+
+    deinit { stop() }
+}
+
+#else
+
+/// iOS keeps AVAudioEngine: AUHAL is macOS-only, and the phantom-output problem it solves
+/// does not arise here.
+private final class EngineCapture: @unchecked Sendable {
+    private let store: SampleStore
+    private let targetFormat: AVAudioFormat
+    private var engine: AVAudioEngine?
+    private var converter: AVAudioConverter?
+    private var converterInputFormat: AVAudioFormat?
+    private let active = OSAllocatedUnfairLock<Bool>(initialState: false)
+
+    init(store: SampleStore, targetFormat: AVAudioFormat) {
+        self.store = store
+        self.targetFormat = targetFormat
+    }
+
+    func open() throws {
+        close()
+        let newEngine = AVAudioEngine()
+        engine = newEngine
+        active.withLock { $0 = true }
+        newEngine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+            self?.consume(buffer: buffer)
+        }
+        newEngine.prepare()
+        do {
+            try newEngine.start()
+        } catch {
+            active.withLock { $0 = false }
+            throw AudioRecorderError.inputUnavailable(underlying: error)
+        }
+    }
+
+    func close() {
+        active.withLock { $0 = false }
+        if let engine {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        engine = nil
+        converter = nil
+        converterInputFormat = nil
+    }
+
+    private func consume(buffer: AVAudioPCMBuffer) {
         guard active.withLock({ $0 }) else { return }
-
         if converter == nil || !(converterInputFormat?.isEqual(to: buffer.format) ?? false) {
             converter = AVAudioConverter(from: buffer.format, to: targetFormat)
             converterInputFormat = buffer.format
@@ -100,80 +471,46 @@ private final class TapConverter: @unchecked Sendable {
         guard let converter else { return }
 
         let ratio = targetFormat.sampleRate / buffer.format.sampleRate
-        let outputCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
-        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outputCapacity) else {
-            return
-        }
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+        guard let output = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
 
-        var error: NSError?
-        var suppliedInput = false
-        let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
-            if suppliedInput {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-            suppliedInput = true
+        var supplied = false
+        let status = converter.convert(to: output, error: nil) { _, outStatus in
+            if supplied { outStatus.pointee = .noDataNow; return nil }
+            supplied = true
             outStatus.pointee = .haveData
             return buffer
         }
-
-        guard status != .error, let channelData = outputBuffer.floatChannelData else { return }
-        let frames = UnsafeBufferPointer(start: channelData[0], count: Int(outputBuffer.frameLength))
-        store.append(frames)
+        guard status != .error, let channelData = output.floatChannelData else { return }
+        store.append(UnsafeBufferPointer(start: channelData[0], count: Int(output.frameLength)))
     }
 }
 
-/// Identity of the current default input, used to tell "the device is still renegotiating"
-/// from "the device has settled". A Bluetooth headset entering microphone mode changes its
-/// nominal sample rate, and may replace its streams more than once on the way.
-private struct InputDeviceState: Equatable {
-    var deviceID: AudioDeviceID
-    var sampleRate: Double
-
-    static func current() -> InputDeviceState? {
-        var deviceID = AudioDeviceID(0)
-        var deviceSize = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var deviceAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultInputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        guard AudioObjectGetPropertyData(
-            AudioObjectID(kAudioObjectSystemObject), &deviceAddress, 0, nil, &deviceSize, &deviceID
-        ) == noErr, deviceID != kAudioObjectUnknown else { return nil }
-
-        var sampleRate = Double(0)
-        var rateSize = UInt32(MemoryLayout<Double>.size)
-        var rateAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        guard AudioObjectGetPropertyData(
-            deviceID, &rateAddress, 0, nil, &rateSize, &sampleRate
-        ) == noErr, sampleRate > 0 else { return nil }
-
-        return InputDeviceState(deviceID: deviceID, sampleRate: sampleRate)
-    }
-}
+#endif
 
 /// Captures microphone audio and exposes it as mono 16kHz Float32 samples, the format
 /// whisper.cpp expects. Designed for short hold-to-talk utterances: recording is entirely
-/// in-memory, never buffered to disk, and the microphone is closed the moment the key is
+/// in-memory, never buffered to disk, and the microphone closes the moment the key is
 /// released.
 @MainActor
 public final class AudioRecorder {
-    // nonisolated because TapConverter reads this from the audio thread. It is an immutable
-    // Double, so there is nothing for the main actor to protect.
+    // nonisolated because the capture path reads this from the audio thread. It is an
+    // immutable Double, so there is nothing for the main actor to protect.
     public nonisolated static let whisperSampleRate: Double = 16_000
 
     /// Guard against accidental taps: very short clips make whisper hallucinate text rather
     /// than return nothing.
     private static let minimumDuration: TimeInterval = 0.3
-    /// How long the device's identity and sample rate must hold still before we trust it.
-    private static let deviceSettleDuration: TimeInterval = 0.25
-    /// Ceiling on waiting for a device to settle, so a genuinely broken input still fails.
-    private static let deviceSettleTimeout: TimeInterval = 3.0
+    /// Bound on recovery attempts within one hold, so nothing can loop indefinitely.
+    private static let maximumRebuilds = 3
+    /// How long device events must stop arriving before a rebuild is attempted.
+    ///
+    /// Not a guess about how long any hardware takes. CoreAudio emits a *burst* of property
+    /// changes while a device reconfigures, and rebuilding on the first one lands on a state
+    /// that is about to change again. Each new event restarts this window, so the wait
+    /// lasts exactly as long as the device keeps changing, however long that is, rather
+    /// than a duration hardcoded from someone else's headphones.
+    private static let eventCoalescingWindow: TimeInterval = 0.12
 
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
@@ -183,20 +520,29 @@ public final class AudioRecorder {
     )!
 
     private let store = SampleStore()
-    private var engine: AVAudioEngine?
-    private var tap: TapConverter?
-    private var configChangeObserver: NSObjectProtocol?
-    private var supervisorTask: Task<Void, Never>?
+    private var rebuildTask: Task<Void, Never>?
     private var isRecording = false
     private var recordingStartedAt: Date?
+    private var openedDeviceState: InputDeviceState?
     private var rebuildCount = 0
+    private var pendingForcedRebuild = false
 
-    /// Fires on the main actor the first time real audio actually reaches the tap.
+    #if os(macOS)
+    private let deviceObserver = DeviceChangeObserver()
+    #endif
+
+    #if os(macOS)
+    private lazy var capture = AUHALCapture(store: store, targetFormat: targetFormat)
+    #else
+    private lazy var capture = EngineCapture(store: store, targetFormat: targetFormat)
+    #endif
+
+    /// Fires on the main actor the first time real audio actually reaches the capture path.
     ///
-    /// `engine.start()` returning is not the same moment: on a Bluetooth headset the first
-    /// buffer can be most of a second later, and the recording can even be torn down and
-    /// rebuilt in between. Showing "Recording" off `start()` therefore invited speaking into
-    /// an input that was not live yet, which is exactly how the first words went missing.
+    /// Starting the unit returning success is not the same moment: on a Bluetooth headset
+    /// the first buffer can be most of a second later, and capture can even be torn down and
+    /// rebuilt in between. Showing "Recording" through that gap is what invited speaking
+    /// into an input that was not live yet, losing the first words.
     public var onCaptureBegan: (@MainActor () -> Void)?
 
     public init() {}
@@ -227,19 +573,25 @@ public final class AudioRecorder {
         #endif
 
         store.reset()
+        store.setFirstBufferHandler { [weak self] in
+            Task { @MainActor [weak self] in
+                logger.notice("first audio buffer received")
+                self?.onCaptureBegan?()
+            }
+        }
         rebuildCount = 0
+        pendingForcedRebuild = false
         isRecording = true
 
         do {
             try openInput()
         } catch {
             isRecording = false
-            closeInput()
-            throw AudioRecorderError.inputUnavailable(underlying: error)
+            capture.close()
+            throw error
         }
 
         recordingStartedAt = Date()
-        superviseInput()
     }
 
     /// Stops capturing, closes the microphone, and returns the samples, or nil if the hold
@@ -249,10 +601,9 @@ public final class AudioRecorder {
         recordingStartedAt = nil
         isRecording = false
 
-        // Closed immediately rather than held open: the microphone indicator going out is
-        // how you know the recording ended, and this app's usage is one-and-done rather
-        // than back-to-back, so nothing is gained by keeping the device warm.
-        closeInput()
+        stopObserving()
+        capture.close()
+        openedDeviceState = nil
 
         let samples = store.drain()
         guard duration >= Self.minimumDuration, !samples.isEmpty else { return nil }
@@ -263,136 +614,81 @@ public final class AudioRecorder {
     public func teardown() {
         isRecording = false
         recordingStartedAt = nil
-        closeInput()
+        stopObserving()
+        capture.close()
+        openedDeviceState = nil
+    }
+
+    private func stopObserving() {
+        rebuildTask?.cancel()
+        rebuildTask = nil
+        store.setFirstBufferHandler(nil)
+        #if os(macOS)
+        deviceObserver.stop()
+        #endif
     }
 
     // MARK: - Input lifecycle
 
-    /// Opens the microphone: builds an engine, installs the tap, and starts it.
-    ///
-    /// A *new* AVAudioEngine every time, deliberately. An engine caches the input hardware's
-    /// format the first time `inputNode` is touched, and `installTap(format: nil)` resolves
-    /// against that cached value rather than against the hardware. So a reused engine keeps
-    /// asserting the format it first saw: after a headset switches from 48kHz to 24kHz,
-    /// every `start()` on that same engine fails with -10868 forever.
     private func openInput() throws {
-        closeInput()
-
-        let newEngine = AVAudioEngine()
-        let newTap = TapConverter(targetFormat: targetFormat, store: store)
-        engine = newEngine
-        tap = newTap
-
-        let inputNode = newEngine.inputNode
-        inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: nil) { buffer, _ in
-            newTap.consume(buffer: buffer)
+        #if os(macOS)
+        guard let deviceID = InputDeviceState.defaultInputDeviceID() else {
+            throw AudioRecorderError.inputDeviceUnavailable
         }
-
-        configChangeObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: newEngine,
-            queue: nil
-        ) { _ in
-            // Deliberately empty of recovery logic. This notification arrives roughly 450ms
-            // after the engine has already stopped itself, which is far too late to be the
-            // trigger for anything. superviseInput() watches `isRunning` instead.
-            logger.notice("configuration change notification (informational)")
+        try capture.open(deviceID: deviceID)
+        openedDeviceState = InputDeviceState.current()
+        deviceObserver.observe(deviceID: deviceID) { [weak self] reason, forcesRebuild in
+            Task { @MainActor [weak self] in
+                self?.deviceDidChange(reason: reason, forcesRebuild: forcesRebuild)
+            }
         }
-
-        newEngine.prepare()
-        try newEngine.start()
+        #else
+        try capture.open()
+        openedDeviceState = InputDeviceState.current()
+        #endif
     }
 
-    private func closeInput() {
-        supervisorTask?.cancel()
-        supervisorTask = nil
-        if let observer = configChangeObserver {
-            NotificationCenter.default.removeObserver(observer)
-            configChangeObserver = nil
-        }
-        tap?.retire()
-        tap = nil
-        if let engine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
-        }
-        engine = nil
+    /// CoreAudio reported something that may have invalidated capture.
+    private func deviceDidChange(reason: String, forcesRebuild: Bool) {
+        guard isRecording else { return }
+        logger.notice("device event: \(reason, privacy: .public)")
+        if forcesRebuild { pendingForcedRebuild = true }
+        scheduleRebuild()
     }
 
-    /// Watches the input for the duration of a hold, rebuilding it when it stops.
+    /// Rebuilds capture once the device has stopped changing.
     ///
-    /// Engaging the microphone makes a Bluetooth headset leave A2DP for a mode that can
-    /// carry input, at a different sample rate. AVAudioEngine responds to that by stopping
-    /// itself, and the recording is dead from then on unless something notices.
-    ///
-    /// Getting the recovery *timing* right is the whole problem. Rebuilding the instant the
-    /// engine stops fed back on itself, because tearing an engine down releases the headset
-    /// back to A2DP and building a new one drags it into microphone mode again: six restarts
-    /// in five seconds, with the microphone indicator visibly blinking. Not rebuilding at
-    /// all, and merely restarting the same engine, fails permanently with -10868 because
-    /// that engine has the pre-switch sample rate cached.
-    ///
-    /// So: wait for the device to hold still, then rebuild exactly once.
-    private func superviseInput() {
-        supervisorTask?.cancel()
-        supervisorTask = Task { @MainActor [weak self] in
-            var announcedCapture = false
+    /// Every new event restarts the window, so this waits precisely as long as the hardware
+    /// takes and no longer. There is no timeout on how slow a device is allowed to be: the
+    /// only bound is the user releasing the key.
+    private func scheduleRebuild() {
+        rebuildTask?.cancel()
+        rebuildTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.eventCoalescingWindow * 1_000_000_000))
+            guard !Task.isCancelled, let self, self.isRecording else { return }
+            guard self.rebuildCount < Self.maximumRebuilds else {
+                logger.error("refusing to rebuild capture again this recording")
+                return
+            }
 
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 25 * NSEC_PER_MSEC)
-                guard !Task.isCancelled, let self, self.isRecording else { return }
+            // A rate or stream event that left us on the same device at the same rate
+            // changed nothing we depend on, so there is nothing to rebuild. Only IO
+            // stopping abnormally is unconditional.
+            let deviceMoved = InputDeviceState.current() != self.openedDeviceState
+            guard deviceMoved || self.pendingForcedRebuild else {
+                logger.notice("device event settled back to the state we opened against")
+                return
+            }
+            self.pendingForcedRebuild = false
 
-                if !announcedCapture, self.store.hasReceivedAudio {
-                    announcedCapture = true
-                    logger.notice("first audio buffer received")
-                    self.onCaptureBegan?()
-                }
-
-                guard let engine = self.engine, !engine.isRunning else { continue }
-
-                logger.notice("input stopped, waiting for the device to settle")
-                guard await self.waitForSettledInputDevice(), !Task.isCancelled,
-                      let self = Optional(self), self.isRecording else { return }
-
-                self.rebuildCount += 1
-                do {
-                    try self.openInput()
-                    logger.notice("input rebuilt after device settled (rebuild \(self.rebuildCount, privacy: .public))")
-                } catch {
-                    logger.error("rebuild failed: \(String(describing: error), privacy: .public)")
-                }
+            self.rebuildCount += 1
+            do {
+                try self.openInput()
+                logger.notice("capture rebuilt (rebuild \(self.rebuildCount, privacy: .public))")
+            } catch {
+                logger.error("rebuild failed: \(String(describing: error), privacy: .public)")
             }
         }
     }
 
-    /// Polls the default input device until its identity and nominal sample rate have been
-    /// unchanged for `deviceSettleDuration`. Returns false if it never settles.
-    ///
-    /// This is the piece that was missing. Rebuilding while the headset is still
-    /// renegotiating just produces another engine pinned to a rate that is about to change
-    /// again; waiting first means one rebuild lands on the format the device actually
-    /// settled on.
-    private func waitForSettledInputDevice() async -> Bool {
-        var lastSeen = InputDeviceState.current()
-        var unchangedSince = Date()
-        let deadline = Date().addingTimeInterval(Self.deviceSettleTimeout)
-
-        while Date() < deadline {
-            try? await Task.sleep(nanoseconds: 40 * NSEC_PER_MSEC)
-            if Task.isCancelled { return false }
-
-            let now = InputDeviceState.current()
-            if now != lastSeen {
-                lastSeen = now
-                unchangedSince = Date()
-                continue
-            }
-            if now != nil, Date().timeIntervalSince(unchangedSince) >= Self.deviceSettleDuration {
-                return true
-            }
-        }
-        logger.error("input device never settled")
-        return false
-    }
 }
