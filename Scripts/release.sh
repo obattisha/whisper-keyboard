@@ -63,7 +63,7 @@ PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
 if [[ -n "$PREV_TAG" ]]; then
     CHANGES=$(git log --no-merges --format='%s' "$PREV_TAG..HEAD")
 else
-    CHANGES="First DMG release"
+    CHANGES="First release"
 fi
 CHANGES_HTML=$(printf '%s\n' "$CHANGES" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's|.*|<li>&</li>|')
 CHANGES_MD=$(printf '%s\n' "$CHANGES" | sed 's/^/- /')
