@@ -97,7 +97,26 @@ Since you're building from source, macOS never quarantines the app the way it wo
 downloaded binary — there's no Gatekeeper "unidentified developer" warning to click
 through.
 
-## Installing permanently
+## Download
+
+Grab the DMG from the [latest release](https://github.com/obattisha/whisper-keyboard/releases/latest),
+open it, and drag WhisperKeyboard into Applications. It isn't notarized, so the first time
+you open it macOS blocks it: go to **System Settings → Privacy & Security** and click
+**Open Anyway**. After that, updates come through the menu's **Check for Updates…** item
+(the app also checks on its own every 6 hours).
+
+## Releasing
+
+```
+./Scripts/release.sh 0.3.0
+```
+Builds a Release DMG, signs it with the Sparkle key in your login keychain, and publishes a
+GitHub Release with the DMG and an `appcast.xml`. Installed copies read that appcast from
+`releases/latest`, so publishing is all it takes for them to see the update. Back up the
+Sparkle key (`generate_keys -x <file>`, from Sparkle's `bin/` under DerivedData's
+`SourcePackages/artifacts`) — without it, existing installs can't be updated.
+
+## Installing permanently from source
 
 `Cmd+R` runs the app straight out of Xcode's DerivedData folder, which is fine for
 iterating but not for daily use. Once the Xcode GUI build from step 3 above has succeeded
@@ -145,8 +164,8 @@ rather than seamless cursor insertion.
   since rebuilding from Xcode can churn the code signature TCC keys off of).
 - Adding new source files: re-run `xcodegen generate` (or `./Scripts/setup.sh` again) —
   `WhisperKeyboard.xcodeproj` is generated from `project.yml` and is not committed to git.
-  This wipes the signing team Xcode resolved earlier, so open the regenerated project once
-  in the Xcode GUI to re-pick it before your next `Cmd+R` or `install.sh`.
+  Put your team in `Config/Local.xcconfig` (gitignored) as `DEVELOPMENT_TEAM = <id>` and
+  it survives regeneration; otherwise re-pick it once in the Xcode GUI.
 
 ## Known limitations (v1)
 

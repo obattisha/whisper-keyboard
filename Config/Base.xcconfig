@@ -1,0 +1,4 @@
+// Shared base config for the app targets. Machine-specific settings (DEVELOPMENT_TEAM) go in
+// Config/Local.xcconfig, which is gitignored; the `?` makes the include optional, so a fresh
+// clone without one still builds and Xcode's GUI can pick a team as before.
+#include? "Local.xcconfig"

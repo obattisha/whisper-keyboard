@@ -16,8 +16,14 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>WKSourceDirectory</key>
-	<string>$(PROJECT_DIR)</string>
+	<key>SUFeedURL</key>
+	<string>https://github.com/obattisha/whisper-keyboard/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>wh8D1tJfH3//4AQHcHovV88fDd+6V/rzUjsa2P55iXA=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>21600</integer>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>

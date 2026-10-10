@@ -15,11 +15,17 @@ packages:
   KeyboardShortcuts:
     url: https://github.com/sindresorhus/KeyboardShortcuts
     from: 1.9.0
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.6.0
 
 targets:
   WhisperKeyboard:
     type: application
     platform: macOS
+    configFiles:
+      Debug: Config/Base.xcconfig
+      Release: Config/Base.xcconfig
     sources:
       - path: App
         excludes:
@@ -59,6 +65,7 @@ targets:
       - package: AudioCaptureKit
       - package: InputInjectionKit
       - package: KeyboardShortcuts
+      - package: Sparkle
 
   WhisperKeyboardMobile:
     type: application
