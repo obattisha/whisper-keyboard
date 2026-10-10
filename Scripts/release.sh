@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds a release DMG, signs it for Sparkle, and publishes it as a GitHub Release with an
+# Builds a release zip, signs it for Sparkle, and publishes it as a GitHub Release with an
 # appcast.xml attached. Installed copies find it through SUFeedURL in Info.plist, which
 # points at releases/latest/download/appcast.xml, so the newest release is always the feed.
 #
@@ -35,7 +35,7 @@ BUILD_NUMBER=$(git rev-list --count HEAD)
 OUT="build/release/$TAG"
 DERIVED="build/DerivedData"
 rm -rf "$OUT"
-mkdir -p "$OUT/dmg"
+mkdir -p "$OUT"
 
 echo "Building $VERSION ($BUILD_NUMBER)..."
 xcodebuild -project WhisperKeyboard.xcodeproj -scheme WhisperKeyboard -configuration Release \
@@ -45,16 +45,19 @@ xcodebuild -project WhisperKeyboard.xcodeproj -scheme WhisperKeyboard -configura
 APP="$DERIVED/Build/Products/Release/WhisperKeyboard.app"
 [[ -d "$APP" ]] || { echo "error: build produced no app" >&2; exit 1; }
 
-echo "Making DMG..."
-DMG_NAME="WhisperKeyboard-$VERSION.dmg"
-DMG="$OUT/$DMG_NAME"
-cp -R "$APP" "$OUT/dmg/"
-ln -s /Applications "$OUT/dmg/Applications"
-hdiutil create -quiet -volname "WhisperKeyboard" -srcfolder "$OUT/dmg" -format UDZO "$DMG"
+# A zip, not a DMG: on this Mac `hdiutil create`/`convert` fail ("Permission denied" /
+# "Resource temporarily unavailable") even outside any sandbox, and the `makehybrid`
+# workaround adds Finder info that breaks the app's code signature once it's copied out.
+# ditto keeps the signature intact, Sparkle installs from zips natively, and Safari unzips
+# on download.
+echo "Zipping..."
+ZIP_NAME="WhisperKeyboard-$VERSION.zip"
+ZIP="$OUT/$ZIP_NAME"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
 echo "Signing for Sparkle..."
 SIGN_UPDATE="$DERIVED/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
-SPARKLE_SIG=$("$SIGN_UPDATE" "$DMG")
+SPARKLE_SIG=$("$SIGN_UPDATE" "$ZIP")
 
 PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
 if [[ -n "$PREV_TAG" ]]; then
@@ -79,7 +82,7 @@ cat > "$OUT/appcast.xml" <<XML
       <description><![CDATA[<ul>
 $CHANGES_HTML
 </ul>]]></description>
-      <enclosure url="https://github.com/$REPO/releases/download/$TAG/$DMG_NAME" $SPARKLE_SIG type="application/octet-stream"/>
+      <enclosure url="https://github.com/$REPO/releases/download/$TAG/$ZIP_NAME" $SPARKLE_SIG type="application/octet-stream"/>
     </item>
   </channel>
 </rss>
@@ -87,10 +90,10 @@ XML
 
 NOTES="$CHANGES_MD
 
-**Install:** open the DMG and drag WhisperKeyboard into Applications. The app isn't notarized, so the first time you open it macOS will block it: go to System Settings → Privacy & Security and click **Open Anyway**. Later versions install from the app's Check for Updates menu item."
+**Install:** download the zip (Safari unzips it) and drag WhisperKeyboard into Applications. The app isn't notarized, so the first time you open it macOS will block it: go to System Settings → Privacy & Security and click **Open Anyway**. Later versions install from the app's Check for Updates menu item."
 
 echo "Publishing $TAG..."
-gh release create "$TAG" "$DMG" "$OUT/appcast.xml" --repo "$REPO" --target main \
+gh release create "$TAG" "$ZIP" "$OUT/appcast.xml" --repo "$REPO" --target main \
     --title "$VERSION" --notes "$NOTES"
 git fetch -q --tags origin
 echo "Done: https://github.com/$REPO/releases/tag/$TAG"

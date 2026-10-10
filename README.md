@@ -99,8 +99,8 @@ through.
 
 ## Download
 
-Grab the DMG from the [latest release](https://github.com/obattisha/whisper-keyboard/releases/latest),
-open it, and drag WhisperKeyboard into Applications. It isn't notarized, so the first time
+Grab the zip from the [latest release](https://github.com/obattisha/whisper-keyboard/releases/latest)
+(Safari unzips it) and drag WhisperKeyboard into Applications. It isn't notarized, so the first time
 you open it macOS blocks it: go to **System Settings → Privacy & Security** and click
 **Open Anyway**. After that, updates come through the menu's **Check for Updates…** item
 (the app also checks on its own every 6 hours).
@@ -110,8 +110,8 @@ you open it macOS blocks it: go to **System Settings → Privacy & Security** an
 ```
 ./Scripts/release.sh 0.3.0
 ```
-Builds a Release DMG, signs it with the Sparkle key in your login keychain, and publishes a
-GitHub Release with the DMG and an `appcast.xml`. Installed copies read that appcast from
+Builds a Release zip, signs it with the Sparkle key in your login keychain, and publishes a
+GitHub Release with the zip and an `appcast.xml`. Installed copies read that appcast from
 `releases/latest`, so publishing is all it takes for them to see the update. Back up the
 Sparkle key (`generate_keys -x <file>`, from Sparkle's `bin/` under DerivedData's
 `SourcePackages/artifacts`) — without it, existing installs can't be updated.
