@@ -1,5 +1,8 @@
 import AppKit
 import ApplicationServices
+import os
+
+private let logger = Logger(subsystem: "com.omar.whisperkeyboard", category: "insert")
 
 /// Inserts transcribed text at the current cursor position in whichever app is focused.
 /// Requires the app to be trusted for Accessibility (System Settings > Privacy & Security
@@ -38,12 +41,18 @@ public enum TextInserter {
     /// selected-text attribute.
     public static func insert(_ text: String) throws {
         guard isAccessibilityTrusted else {
+            logger.error("insert: not trusted for Accessibility")
             throw InsertionError.notTrusted
         }
 
-        if !frontmostAppIsElectron(), insertViaAccessibilityAPI(text) {
+        let target = focusedApplication()
+        let electron = isElectron(target)
+        logger.notice("insert: target=\(target?.bundleIdentifier ?? "nil", privacy: .public) electron=\(electron, privacy: .public)")
+        if !electron, insertViaAccessibilityAPI(text) {
+            logger.notice("insert: AX path reported success")
             return
         }
+        logger.notice("insert: pasting via Cmd-V")
         insertViaPasteboard(text)
     }
 
@@ -52,10 +61,26 @@ public enum TextInserter {
     /// editor (ProseMirror, Monaco, etc.) never sees the change, so nothing appears. That
     /// "success" also skipped the paste fallback, leaving the text only in Recent
     /// Transcriptions. Go straight to pasting for these apps.
-    private static func frontmostAppIsElectron() -> Bool {
-        guard let bundleURL = NSWorkspace.shared.frontmostApplication?.bundleURL else { return false }
+    private static func isElectron(_ app: NSRunningApplication?) -> Bool {
+        guard let bundleURL = app?.bundleURL else { return false }
         let electronFramework = bundleURL.appendingPathComponent("Contents/Frameworks/Electron Framework.framework")
         return FileManager.default.fileExists(atPath: electronFramework.path)
+    }
+
+    /// The app that owns keyboard focus, asked of Accessibility rather than
+    /// `NSWorkspace.frontmostApplication`. In this menu-bar (LSUIElement) app that property
+    /// can go stale: it reported com.apple.loginwindow while Claude was in front, which made
+    /// the Electron check above miss and the dictation vanish into the AX path again.
+    private static func focusedApplication() -> NSRunningApplication? {
+        var appRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute as CFString, &appRef)
+        guard result == .success, let appRef else { return NSWorkspace.shared.frontmostApplication }
+        // Safe force-cast: kAXFocusedApplicationAttribute always yields an AXUIElement on .success.
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(appRef as! AXUIElement, &pid) == .success else {
+            return NSWorkspace.shared.frontmostApplication
+        }
+        return NSRunningApplication(processIdentifier: pid)
     }
 
     private static func insertViaAccessibilityAPI(_ text: String) -> Bool {
@@ -104,6 +129,9 @@ public enum TextInserter {
         let keyUp = CGEvent(keyboardEventSource: source, virtualKey: virtualKeyCodeV, keyDown: false)
         keyDown?.flags = .maskCommand
         keyUp?.flags = .maskCommand
+        if keyDown == nil || keyUp == nil {
+            logger.error("insert: failed to create Cmd-V events")
+        }
         keyDown?.post(tap: .cgSessionEventTap)
         keyUp?.post(tap: .cgSessionEventTap)
 
