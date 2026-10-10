@@ -14,7 +14,9 @@ BUILT_PRODUCTS_DIR=$(xcodebuild -project WhisperKeyboard.xcodeproj -scheme Whisp
     | awk -F' = ' '/ BUILT_PRODUCTS_DIR /{print $2}')
 
 echo "Installing to /Applications/WhisperKeyboard.app..."
-pkill -x WhisperKeyboard 2>/dev/null || true
+# -a: pkill skips its own ancestors by default, and when the menu's update item runs this
+# via update.sh, the app is an ancestor, so without it the old copy kept running.
+pkill -a -x WhisperKeyboard 2>/dev/null || true
 rm -rf /Applications/WhisperKeyboard.app
 cp -R "$BUILT_PRODUCTS_DIR/WhisperKeyboard.app" /Applications/
 
