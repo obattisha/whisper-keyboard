@@ -41,10 +41,21 @@ public enum TextInserter {
             throw InsertionError.notTrusted
         }
 
-        if insertViaAccessibilityAPI(text) {
+        if !frontmostAppIsElectron(), insertViaAccessibilityAPI(text) {
             return
         }
         insertViaPasteboard(text)
+    }
+
+    /// Electron apps (Claude desktop, Slack, VS Code, ...) report `kAXSelectedTextAttribute`
+    /// as settable on their rich-text editors and return `.success` when it's set, but the
+    /// editor (ProseMirror, Monaco, etc.) never sees the change, so nothing appears. That
+    /// "success" also skipped the paste fallback, leaving the text only in Recent
+    /// Transcriptions. Go straight to pasting for these apps.
+    private static func frontmostAppIsElectron() -> Bool {
+        guard let bundleURL = NSWorkspace.shared.frontmostApplication?.bundleURL else { return false }
+        let electronFramework = bundleURL.appendingPathComponent("Contents/Frameworks/Electron Framework.framework")
+        return FileManager.default.fileExists(atPath: electronFramework.path)
     }
 
     private static func insertViaAccessibilityAPI(_ text: String) -> Bool {
