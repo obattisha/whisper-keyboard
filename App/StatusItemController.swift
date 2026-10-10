@@ -41,6 +41,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let downloadModelItem = NSMenuItem(title: "Download Model…", action: #selector(downloadCurrentModel), keyEquivalent: "")
     private var languageItems: [LanguageHint: NSMenuItem] = [:]
     private var modelItems: [WhisperModelVariant: NSMenuItem] = [:]
+    private let updateItem = NSMenuItem(title: "Update from GitHub", action: #selector(updateFromGitHub), keyEquivalent: "")
     private let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
 
     // Insertion has no reliable success signal — the clipboard-paste fallback just sends
@@ -393,6 +394,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(accessibilityItem)
 
         menu.addItem(.separator())
+        updateItem.target = self
+        menu.addItem(updateItem)
+
         let quitItem = NSMenuItem(title: "Quit whisper-keyboard", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -530,6 +534,50 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     @objc private func openSettings() {
         SettingsWindowController.shared.show()
+    }
+
+    /// Runs Scripts/update.sh from the checkout this build came from (baked into Info.plist
+    /// at build time). On success install.sh kills this process and the script relaunches the
+    /// new copy, so only failure comes back here. Output goes to a log file rather than a
+    /// pipe, since the script outlives this process.
+    @objc private func updateFromGitHub() {
+        guard let sourceDir = Bundle.main.object(forInfoDictionaryKey: "WKSourceDirectory") as? String else {
+            setError("Update failed: source folder unknown")
+            return
+        }
+        let script = URL(fileURLWithPath: sourceDir).appendingPathComponent("Scripts/update.sh")
+        let logURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/WhisperKeyboard-update.log")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        guard let log = try? FileHandle(forWritingTo: logURL) else {
+            setError("Update failed: can't write log")
+            return
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [script.path]
+        process.standardOutput = log
+        process.standardError = log
+        process.terminationHandler = { [weak self] finished in
+            let status = finished.terminationStatus
+            Task { @MainActor in
+                guard let self else { return }
+                self.updateItem.title = "Update from GitHub"
+                self.updateItem.isEnabled = true
+                if status != 0 {
+                    logger.error("update.sh exited \(status, privacy: .public)")
+                    self.setError("Update failed, see ~/Library/Logs/WhisperKeyboard-update.log")
+                }
+            }
+        }
+        do {
+            try process.run()
+            updateItem.title = "Updating…"
+            updateItem.isEnabled = false
+        } catch {
+            setError("Update failed: \(error.localizedDescription)")
+        }
     }
 
     @objc private func quit() {
