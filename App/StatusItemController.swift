@@ -41,7 +41,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let downloadModelItem = NSMenuItem(title: "Download Model…", action: #selector(downloadCurrentModel), keyEquivalent: "")
     private var languageItems: [LanguageHint: NSMenuItem] = [:]
     private var modelItems: [WhisperModelVariant: NSMenuItem] = [:]
-    private let updateItem = NSMenuItem(title: "Update from GitHub", action: #selector(updateFromGitHub), keyEquivalent: "")
+    private let updateItem = NSMenuItem(title: "Check for Updates", action: #selector(updateItemClicked), keyEquivalent: "")
+    private enum UpdateStatus {
+        case idle, checking, upToDate, behind(Int), installing
+    }
+    private var updateStatus: UpdateStatus = .idle {
+        didSet { refreshUpdateItem() }
+    }
     private let launchAtLoginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
 
     // Insertion has no reliable success signal — the clipboard-paste fallback just sends
@@ -70,6 +76,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: "mic", accessibilityDescription: "whisper-keyboard")
         buildMenu()
         refresh()
+        startPeriodicUpdateChecks()
 
         // Flipped from "Preparing microphone…" to "Recording…" by the first buffer that
         // actually arrives, not by start() returning.
@@ -536,16 +543,105 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         SettingsWindowController.shared.show()
     }
 
-    /// Runs Scripts/update.sh from the checkout this build came from (baked into Info.plist
-    /// at build time). On success install.sh kills this process and the script relaunches the
-    /// new copy, so only failure comes back here. Output goes to a log file rather than a
-    /// pipe, since the script outlives this process.
-    @objc private func updateFromGitHub() {
-        guard let sourceDir = Bundle.main.object(forInfoDictionaryKey: "WKSourceDirectory") as? String else {
+    // MARK: - Updates
+
+    /// The checkout this build came from, baked into Info.plist at build time.
+    private var sourceDirectory: URL? {
+        (Bundle.main.object(forInfoDictionaryKey: "WKSourceDirectory") as? String).map { URL(fileURLWithPath: $0) }
+    }
+
+    /// Checks on launch and then every 6 hours, the same shape as Sparkle's scheduled check,
+    /// so an update shows up in the menu without anyone having to ask. Failures stay silent
+    /// here (offline, SSH agent locked); only a manual check reports them.
+    private func startPeriodicUpdateChecks() {
+        Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.checkForUpdates(manual: false)
+                try? await Task.sleep(nanoseconds: 6 * 60 * 60 * NSEC_PER_SEC)
+            }
+        }
+    }
+
+    private func refreshUpdateItem() {
+        switch updateStatus {
+        case .idle:
+            updateItem.title = "Check for Updates"
+        case .checking:
+            updateItem.title = "Checking for Updates…"
+        case .upToDate:
+            updateItem.title = "Check for Updates (up to date)"
+        case .behind(let count):
+            updateItem.title = "Install Update (\(count) commit\(count == 1 ? "" : "s") behind)"
+        case .installing:
+            updateItem.title = "Updating…"
+        }
+        switch updateStatus {
+        case .checking, .installing:
+            updateItem.isEnabled = false
+        default:
+            updateItem.isEnabled = true
+        }
+    }
+
+    @objc private func updateItemClicked() {
+        if case .behind = updateStatus {
+            installUpdate()
+        } else {
+            Task { await checkForUpdates(manual: true) }
+        }
+    }
+
+    private func checkForUpdates(manual: Bool) async {
+        switch updateStatus {
+        case .checking, .installing:
+            return
+        default:
+            break
+        }
+        guard let script = sourceDirectory?.appendingPathComponent("Scripts/check-update.sh") else { return }
+        let previous = updateStatus
+        updateStatus = .checking
+        guard let behind = await Self.runCheckScript(script.path) else {
+            updateStatus = previous
+            if manual {
+                setError("Couldn't check for updates")
+            }
+            return
+        }
+        updateStatus = behind > 0 ? .behind(behind) : .upToDate
+    }
+
+    /// Runs check-update.sh and parses the commit count it prints, or nil on any failure.
+    /// Its output is a single line, so reading the pipe after exit can't fill the buffer.
+    private nonisolated static func runCheckScript(_ path: String) async -> Int? {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            let output = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [path]
+            process.standardOutput = output
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { finished in
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                continuation.resume(returning: finished.terminationStatus == 0 ? Int(text) : nil)
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(returning: nil)
+            }
+        }
+    }
+
+    /// Runs Scripts/update.sh. On success install.sh kills this process and the script
+    /// relaunches the new copy, so only failure comes back here. Output goes to a log file
+    /// rather than a pipe, since the script outlives this process.
+    private func installUpdate() {
+        guard let script = sourceDirectory?.appendingPathComponent("Scripts/update.sh") else {
             setError("Update failed: source folder unknown")
             return
         }
-        let script = URL(fileURLWithPath: sourceDir).appendingPathComponent("Scripts/update.sh")
         let logURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/WhisperKeyboard-update.log")
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
@@ -554,6 +650,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             return
         }
 
+        let previous = updateStatus
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [script.path]
@@ -563,8 +660,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             let status = finished.terminationStatus
             Task { @MainActor in
                 guard let self else { return }
-                self.updateItem.title = "Update from GitHub"
-                self.updateItem.isEnabled = true
+                self.updateStatus = previous
                 if status != 0 {
                     logger.error("update.sh exited \(status, privacy: .public)")
                     self.setError("Update failed, see ~/Library/Logs/WhisperKeyboard-update.log")
@@ -573,8 +669,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         do {
             try process.run()
-            updateItem.title = "Updating…"
-            updateItem.isEnabled = false
+            updateStatus = .installing
         } catch {
             setError("Update failed: \(error.localizedDescription)")
         }

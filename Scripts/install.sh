@@ -18,6 +18,12 @@ pkill -x WhisperKeyboard 2>/dev/null || true
 rm -rf /Applications/WhisperKeyboard.app
 cp -R "$BUILT_PRODUCTS_DIR/WhisperKeyboard.app" /Applications/
 
+# What the "Check for Updates" menu item compares origin/main against. Kept outside the app
+# bundle because writing into it after signing would break the signature (and with it the
+# app's Accessibility/Microphone grants).
+mkdir -p "$HOME/Library/Application Support/WhisperKeyboard"
+git rev-parse HEAD > "$HOME/Library/Application Support/WhisperKeyboard/installed-commit"
+
 echo
 echo "Installed. Launch it from Spotlight/Launchpad/Finder, or run:"
 echo "  open /Applications/WhisperKeyboard.app"
