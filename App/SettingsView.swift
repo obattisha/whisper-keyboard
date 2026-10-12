@@ -23,6 +23,23 @@ struct SettingsView: View {
         Form {
             KeyboardShortcuts.Recorder("Push-to-talk hotkey:", name: .pushToTalk)
 
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Also hold Fn (🌐) to talk", isOn: $settings.useFnKey)
+                if settings.useFnKey {
+                    // macOS acts on a bare Fn press too (emoji picker, input source, or its
+                    // own dictation), which would fire on every release.
+                    Text("Set \"Press 🌐 key to\" to \"Do Nothing\" in Keyboard settings, or macOS will also react to each press.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Open Keyboard Settings") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .font(.caption)
+                }
+            }
+
             Picker("Language:", selection: $settings.languageHint) {
                 Text("Auto-detect").tag(LanguageHint.auto)
                 Text("English").tag(LanguageHint.english)

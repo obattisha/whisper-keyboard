@@ -16,6 +16,11 @@ final class AppSettings: ObservableObject {
         }
     }
 
+    /// Push-to-talk on Fn alone, alongside the recorded shortcut. See FnKeyMonitor.
+    @Published var useFnKey: Bool {
+        didSet { UserDefaults.standard.set(useFnKey, forKey: Keys.useFnKey) }
+    }
+
     static let modelVariantDidChange = Notification.Name("AppSettings.modelVariantDidChange")
     @Published private(set) var launchAtLogin: Bool
     @Published var hasCompletedOnboarding: Bool {
@@ -26,6 +31,7 @@ final class AppSettings: ObservableObject {
         static let languageHint = "languageHint"
         static let modelVariant = "modelVariant"
         static let hasCompletedOnboarding = "hasCompletedOnboarding"
+        static let useFnKey = "useFnKey"
     }
 
     private init() {
@@ -35,6 +41,7 @@ final class AppSettings: ObservableObject {
         // fit for first-run setup. Users can pick a heavier variant from the Model menu.
         modelVariant = defaults.string(forKey: Keys.modelVariant).flatMap { WhisperModelVariant(rawValue: $0) } ?? .largeV3TurboQ5
         hasCompletedOnboarding = defaults.bool(forKey: Keys.hasCompletedOnboarding)
+        useFnKey = defaults.bool(forKey: Keys.useFnKey)
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 

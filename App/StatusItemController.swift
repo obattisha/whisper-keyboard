@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import OSLog
 import KeyboardShortcuts
 import TranscriptionKit
@@ -68,6 +69,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// completion callback) both used to pass the guard and load the model twice.
     private var isLoadingModel = false
     private var errorClearTask: Task<Void, Never>?
+    private let fnMonitor = FnKeyMonitor()
+    private var fnSettingObserver: AnyCancellable?
 
     override init() {
         super.init()
@@ -89,6 +92,25 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         KeyboardShortcuts.onKeyUp(for: .pushToTalk) { [weak self] in
             logger.notice("hotkey keyUp fired")
             self?.endRecordingAndTranscribe()
+        }
+
+        fnMonitor.onPress = { [weak self] in
+            logger.notice("Fn down")
+            self?.beginRecording()
+        }
+        fnMonitor.onRelease = { [weak self] in
+            logger.notice("Fn up")
+            self?.endRecordingAndTranscribe()
+        }
+        fnMonitor.onCancel = { [weak self] in
+            self?.cancelRecording()
+        }
+        fnSettingObserver = settings.$useFnKey.sink { [weak self] enabled in
+            if enabled {
+                self?.fnMonitor.start()
+            } else {
+                self?.fnMonitor.stop()
+            }
         }
 
         Task { [weak self] in await self?.refreshDownloadedVariants() }
@@ -222,6 +244,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             logger.error("startRecordingNow: recorder.start() failed: \(String(describing: error), privacy: .public)")
             setError(error.localizedDescription)
         }
+    }
+
+    /// Throws away an in-progress recording without transcribing it. Used when Fn turns out
+    /// to be part of a shortcut (Fn+Delete and the like) rather than a dictation.
+    private func cancelRecording() {
+        switch state {
+        case .preparingMicrophone, .recording:
+            break
+        default:
+            return
+        }
+        _ = recorder.stopAndCapture()
+        logger.notice("cancelRecording: Fn was part of a shortcut, discarding")
+        state = .idle
     }
 
     private func endRecordingAndTranscribe() {
