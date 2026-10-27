@@ -1,186 +1,141 @@
 # whisper-keyboard
 
-Local, offline dictation for macOS and iOS. On the Mac, hold a hotkey, speak (English or
-Arabic), release — the transcribed text is inserted at your cursor. Runs OpenAI's Whisper
-entirely on-device via [whisper.cpp](https://github.com/ggml-org/whisper.cpp) with Metal
-acceleration — no cloud API, no subscription, and no audio ever leaves the machine.
+Hold down a key while you talk, and when you let go, what you said gets typed wherever your
+cursor is. It understands English and Arabic. Everything runs on your Mac (OpenAI's Whisper
+model, via [whisper.cpp](https://github.com/ggml-org/whisper.cpp)), so your audio never
+leaves your computer and there's nothing to pay for.
 
-The menu bar icon shows live status (Idle / Recording… / Transcribing…) and a **Recent
-Transcriptions** list — every transcription is kept there (in memory only, never written to
-disk) before insertion is even attempted, so a dictation that lands nowhere because no text
-field was focused is still one click away to copy, not lost.
+You need a Mac with Apple Silicon (M1 or newer) on macOS 13.3 or later.
 
-## Models
+## Install
 
-Pick from the menu bar's **Model** submenu at any time — selecting a variant that isn't
-downloaded yet starts downloading it automatically (shown as "Downloading model… N%"), and
-each entry is labeled "(not downloaded)" until it's on disk so you can see what's actually
-available without leaving the menu.
+Open Terminal (Applications > Utilities > Terminal), paste this, and press Return:
 
-| Variant | Size | Speed | Languages |
-| --- | --- | --- | --- |
-| `large-v3-turbo-q5_0` (Q5) — **default** | 574 MB | fastest to download; fast to run | multilingual |
-| `large-v3-turbo` | 1.6 GB | slower to run than Q5 | multilingual, best quality |
-| `distil-large-v3` | 1.5 GB | ~5x faster than `large-v3-turbo` (~0.8% WER cost on long-form audio) | **English-only** |
+```
+curl -fsSL https://raw.githubusercontent.com/obattisha/whisper-keyboard/main/Scripts/get.sh | bash
+```
 
-Q5 is the default for fresh installs (smallest download, fastest, still multilingual) — an
-existing explicit choice in Settings is never overridden. iOS always uses Q5 specifically,
-independent of this default, since phone storage/RAM is more constrained than a Mac.
+It installs the latest version into your Applications folder and opens it. After that the
+app updates itself.
 
-**Language detection**: the menu bar's **Language** submenu (Auto-detect / English / Arabic)
-isn't cosmetic — it's passed straight into whisper.cpp's decoding step, forcing that language
-and skipping Whisper's own auto-detection, which is noticeably less reliable on the short
-clips a hold-to-talk hotkey produces. Arabic is disabled (with an explanatory tooltip)
-whenever an English-only model like `distil-large-v3` is selected, and switching to one while
-Arabic is active falls back to English automatically.
+<details>
+<summary>Rather not use Terminal?</summary>
 
-`ModelManager` pins an expected SHA-256 for each model file (`Types.swift`) and refuses to
-use a download that doesn't match. `large-v3-turbo`/`large-v3-turbo-q5_0` are verified
-against the Git LFS OIDs from https://huggingface.co/ggerganov/whisper.cpp;
-`distil-large-v3` against https://huggingface.co/distil-whisper/distil-large-v3-ggml, its own
-separate repo. If either ever ships new model files upstream, `Scripts/fetch-model.sh` prints
-the actual hash of what it downloads so you can re-pin them.
+Download the zip from the [latest release](https://github.com/obattisha/whisper-keyboard/releases/latest)
+and drag WhisperKeyboard into Applications. macOS blocks it the first time because the app
+isn't notarized by Apple (that costs $99 a year). To get past it, find **Open Anyway** near
+the bottom of **System Settings > Privacy & Security**. You only have to do this once. (The
+Terminal command above skips this, since macOS only runs that check on apps downloaded
+through a browser.)
 
-## Architecture
+</details>
 
-- `Packages/TranscriptionKit` — Swift facade over whisper.cpp (`WhisperEngine`) and model
-  download/verification (`ModelManager`). Platform-agnostic, used unchanged by both the
-  macOS and iOS targets.
-- `Packages/AudioCaptureKit` — microphone capture via `AVAudioEngine`, resampled to the
-  16kHz mono Float32 format Whisper expects. Shared by both targets; the iOS side adds a
-  small `AVAudioSession` activation step macOS doesn't need.
-- `Packages/InputInjectionKit` — macOS-only. Inserts text via the Accessibility API, with
-  a clipboard-paste fallback for apps with weak AX trees (browsers, Electron, Terminal). No
-  iOS equivalent exists (see "iOS companion app" below for how iOS delivers text instead).
-- `App/` — the macOS menu bar shell: status item, hotkey wiring, settings, first-run
-  onboarding.
-- `iOSApp/` — the iOS companion app: a SwiftUI recording screen plus a `DictateIntent`
-  (`AppIntents`) that's assignable to the Action Button or the Shortcuts app.
-- `Vendor/whisper.cpp` — git submodule, pinned to a tagged release. Built into
-  `whisper.xcframework` via whisper.cpp's own `build-xcframework.sh` (the officially
-  supported Apple-platform integration path — it handles Metal shader embedding, which is
-  a known pain point when hand-vendoring ggml's C sources into a custom SPM target). This
-  produces macOS *and* iOS device/simulator slices in one pass — `Scripts/setup.sh`
-  already builds everything both targets need.
+## First launch
 
-## First-time setup
+A setup window walks you through three things:
 
-1. Install full **Xcode** from the App Store (Command Line Tools alone lack the Metal
-   shader compiler `whisper.cpp` needs). Then:
-   ```
-   sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-   ```
-   Open Xcode once to accept the license and install additional components.
-2. Run:
-   ```
-   ./Scripts/setup.sh
-   ```
-   This installs XcodeGen (if needed), fetches the whisper.cpp submodule, builds
-   `whisper.xcframework` with Metal support, and generates `WhisperKeyboard.xcodeproj`.
-3. Open `WhisperKeyboard.xcodeproj` in Xcode and press **Cmd+R** — build from the Xcode
-   GUI the first time, not `xcodebuild` from the command line. The project has no
-   `DEVELOPMENT_TEAM` hardcoded (that's account-specific, so a value that works on one Mac
-   would just break the build on anyone else's); Xcode resolves it from whichever Apple ID
-   is signed into **Xcode > Settings > Accounts**, prompting you to sign in and pick
-   "Automatically manage signing" if you haven't already. A free personal team is enough —
-   no paid Apple Developer Program membership needed. Once resolved this way, subsequent
-   `Cmd+R`/`xcodebuild` builds keep using it — you only need the GUI step again if you
-   re-run `xcodegen generate` (e.g. after adding new source files), which regenerates
-   `WhisperKeyboard.xcodeproj` from scratch.
-4. First launch walks you through downloading the model and granting Microphone +
-   Accessibility permissions.
+1. Downloading the speech model (574 MB, one time).
+2. Allowing the microphone.
+3. Allowing Accessibility, which is what lets it type into other apps. Click the
+   button, then flip the switch next to WhisperKeyboard in the System Settings window that
+   opens.
 
-Default hotkey is **⌃⌥Space** (hold to talk) — changeable from the menu bar icon's
-"Change Hotkey…" item.
+## Using it
 
-Since you're building from source, macOS never quarantines the app the way it would a
-downloaded binary — there's no Gatekeeper "unidentified developer" warning to click
-through.
+Hold **Control + Option + Space** while you talk, then let go. The text shows up a second
+or two later.
 
-## Download
+The **Fn (🌐) key** is easier to hold. To use it, choose **Change Hotkey…** from the mic icon
+in the menu bar and turn on "Also hold Fn (🌐) to talk." Then in **System
+Settings > Keyboard**, set "Press 🌐 key to" to **Do Nothing**, or macOS will also pop up
+the emoji picker every time.
 
-Grab the zip from the [latest release](https://github.com/obattisha/whisper-keyboard/releases/latest)
-(Safari unzips it) and drag WhisperKeyboard into Applications. It isn't notarized, so the first time
-you open it macOS blocks it: go to **System Settings → Privacy & Security** and click
-**Open Anyway**. After that, updates come through the menu's **Check for Updates…** item
-(the app also checks on its own every 6 hours).
+The mic icon in the menu bar also has:
 
-## Releasing
+- **Recent Transcriptions.** If text didn't land anywhere (say no text box was selected),
+  it's still here; click one to copy it.
+- **Language.** Auto-detect works, but picking English or Arabic is more accurate for short
+  clips.
+- **Model.** The default is the smallest download. `large-v3-turbo` (1.6 GB) is the most
+  accurate, and `distil-large-v3` (1.5 GB) is faster but English only.
+- **Check for Updates…** It also checks on its own every few hours.
+
+## If something's off
+
+- **Text never shows up:** check that WhisperKeyboard is switched on in **System Settings >
+  Privacy & Security > Accessibility**. If it's on and still not working (this happens
+  after reinstalling), switch it off and on again.
+- **It types the wrong language:** pick your language from the Language menu instead of
+  Auto-detect.
+
+---
+
+## For developers
+
+### Building from source
+
+1. Install **Xcode** from the App Store (the Command Line Tools alone are missing the Metal
+   compiler whisper.cpp needs), then run
+   `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer` and open Xcode once to
+   accept the license.
+2. Run `./Scripts/setup.sh`. It fetches the whisper.cpp submodule, builds
+   `whisper.xcframework` with Metal, and generates `WhisperKeyboard.xcodeproj` with
+   XcodeGen.
+3. Open the project in Xcode and press **Cmd+R**. Do the first build from the Xcode window
+   so it can pick a signing team from the Apple ID in **Xcode > Settings > Accounts** (a
+   free personal team works). To make that survive regenerating the project, put
+   `DEVELOPMENT_TEAM = <your team id>` in `Config/Local.xcconfig` (gitignored).
+4. `./Scripts/install.sh` builds a Release copy into `/Applications`.
+
+Keep the same signing team across builds. macOS ties the Microphone and Accessibility
+permissions to the app's signature, and treats a build signed by a different team as a new
+app.
+`Scripts/reset-tcc.sh` clears a stale Accessibility grant.
+
+### Releasing
 
 ```
 ./Scripts/release.sh 0.3.0
 ```
-Builds a Release zip, signs it with the Sparkle key in your login keychain, and publishes a
-GitHub Release with the zip and an `appcast.xml`. Installed copies read that appcast from
-`releases/latest`, so publishing is all it takes for them to see the update. Back up the
-Sparkle key (`generate_keys -x <file>`, from Sparkle's `bin/` under DerivedData's
-`SourcePackages/artifacts`) — without it, existing installs can't be updated.
 
-## Installing permanently from source
+This builds a Release zip, signs it with the Sparkle key in the login keychain, and
+publishes a GitHub Release with the zip and an `appcast.xml`. Installed copies read the
+appcast from `releases/latest` (Sparkle), and `Scripts/get.sh` installs from the same
+place, so publishing is all it takes. Back up the Sparkle key with `generate_keys -x <file>`
+(in Sparkle's `bin/` under DerivedData's `SourcePackages/artifacts`); without it, existing
+installs can't be updated.
 
-`Cmd+R` runs the app straight out of Xcode's DerivedData folder, which is fine for
-iterating but not for daily use. Once the Xcode GUI build from step 3 above has succeeded
-at least once (so your signing team is resolved), run:
-```
-./Scripts/install.sh
-```
-This builds a Release configuration and installs it to `/Applications/WhisperKeyboard.app`.
-Launch it from Spotlight/Launchpad/Finder going forward, and grant Microphone/Accessibility
-once when prompted — that grant persists across future `install.sh` reruns as long as the
-same Apple ID/team keeps signing it.
+### Layout
 
-## iOS companion app
+- `App/`: everything in the menu bar, plus hotkeys (the Fn monitor too), settings,
+  onboarding and Sparkle.
+- `Packages/TranscriptionKit`: Swift wrapper over whisper.cpp plus model download and
+  SHA-256 verification (`ModelManager`, hashes pinned in `Types.swift`;
+  `Scripts/fetch-model.sh` prints the hash of a fresh download if upstream files change).
+- `Packages/AudioCaptureKit`: microphone capture, resampled to the 16 kHz mono Float32
+  Whisper expects.
+- `Packages/InputInjectionKit`: types text through the Accessibility API, falling back to a
+  clipboard paste for apps that ignore it (Electron apps like Claude, Slack and VS Code
+  always get the paste).
+- `Vendor/whisper.cpp`: git submodule pinned to a tagged release, built with its own
+  `build-xcframework.sh`.
 
-iOS has no Accessibility API and custom keyboard extensions run under a memory ceiling
-(~48MB) that a Whisper model can't fit in — so this isn't a system keyboard, and can't
-insert text at the cursor in an arbitrary app the way the macOS version does. Instead it's
-a standalone app you trigger via the **Action Button** (or the Shortcuts app on phones
-without one): tap to open the app and start recording, tap again in-app to stop — the
-transcript lands on your clipboard, ready to paste anywhere.
+`TranscriptionKit` and `AudioCaptureKit` are plain SPM packages, so `swift build` and
+`swift test` work on them directly (`swift test` in TranscriptionKit needs a model first:
+`Scripts/fetch-model.sh`).
 
-1. In `WhisperKeyboard.xcodeproj`, switch the scheme to **WhisperKeyboardMobile** and pick
-   your iPhone (or a Simulator, though the Action Button and real microphone input only
-   work on a physical device) as the destination, then **Cmd+R**. Same first-time signing
-   note as the macOS target applies — Xcode resolves your team via a signed-in Apple ID.
-2. First launch walks you through granting Microphone access and downloading the model
-   (defaults to the smaller Q5-quantized variant — 574MB — since phone storage/RAM is more
-   constrained than a Mac).
-3. To assign it to the **Action Button**: open the Shortcuts app, create a new shortcut
-   using the "Dictate" action (whisper-keyboard's `DictateIntent`), save it, then in
-   **Settings > Action Button > Shortcut**, pick that shortcut.
+### Known limitations
 
-This is a first pass, not feature parity with the macOS app: the Action Button only
-fixed-trigger-fires third-party actions (no true continuous hold-to-record the way physical
-hotkeys or Apple's own Camera/Voice Memo actions get), and delivery is clipboard-paste
-rather than seamless cursor insertion.
+- Not sandboxed, so it can't go on the App Store; the Accessibility API it types through
+  needs that.
+- Transcribes once per hold rather than streaming, which is fine for dictation-length
+  clips.
 
-## Development
+### Appendix: iOS companion app (experimental)
 
-- `Packages/TranscriptionKit` and `Packages/AudioCaptureKit` are plain SPM packages —
-  iterate on them directly with `swift build` / `swift test` without Xcode's signing
-  flow. `swift test` in `TranscriptionKit` needs a downloaded model first:
-  `Scripts/fetch-model.sh`.
-- `Scripts/reset-tcc.sh` clears a stale Accessibility grant (common during development,
-  since rebuilding from Xcode can churn the code signature TCC keys off of).
-- Adding new source files: re-run `xcodegen generate` (or `./Scripts/setup.sh` again) —
-  `WhisperKeyboard.xcodeproj` is generated from `project.yml` and is not committed to git.
-  Put your team in `Config/Local.xcconfig` (gitignored) as `DEVELOPMENT_TEAM = <id>` and
-  it survives regeneration; otherwise re-pick it once in the Xcode GUI.
-
-## Known limitations (v1)
-
-- Hotkey is a conventional modifier+key combo (default ⌃⌥Space), not a Fn-hold or
-  double-tap gesture — `KeyboardShortcuts`'s underlying `RegisterEventHotKey` API doesn't
-  support standalone-modifier gestures. A Fn-hold trigger would need a separate
-  `CGEventTap`-based implementation.
-- Not sandboxed, so not App Store-distributable — required for the Accessibility API this
-  app depends on for text insertion. Fine for personal use; share via Developer ID +
-  notarization if ever needed.
-- Batch transcription only (whisper.cpp runs once per utterance on hotkey release), not
-  streaming. Fine for hold-to-talk lengths; would need revisiting for very long holds.
-- iOS is a first pass, not feature parity — see "iOS companion app" above. Notably: no
-  continuous hold-to-record (Action Button fixed-trigger-fires third-party actions once,
-  not held-and-released), and clipboard-paste delivery instead of cursor insertion (no iOS
-  equivalent of the Accessibility API `InputInjectionKit` uses on macOS).
-- The iOS Simulator can't test the Action Button (no physical button) or real microphone
-  input — those need a physical device.
+There's an untested-lately iOS target, `WhisperKeyboardMobile`. iOS doesn't let apps type
+into other apps, and keyboard extensions can't fit a Whisper model in memory, so it's a
+standalone app you trigger from the Action Button (or a Shortcut): it records, transcribes,
+and copies the text to the clipboard. To try it, pick the **WhisperKeyboardMobile** scheme
+in Xcode with your iPhone as the destination and press Cmd+R, then add the "Dictate" action
+to a Shortcut and assign it under **Settings > Action Button**.
