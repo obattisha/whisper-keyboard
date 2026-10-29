@@ -1,7 +1,8 @@
 # whisper-keyboard
 
 Hold down a key while you talk, and when you let go, what you said gets typed wherever your
-cursor is. It understands English and Arabic (and 90+ other languages listed [here](https://whisper-api.com/docs/languages/). Everything runs on your Mac (OpenAI's Whisper
+cursor is. It understands English and Arabic (and 90+ other languages listed
+[here](https://whisper-api.com/docs/languages/)). Everything runs on your Mac (OpenAI's Whisper
 model, via [whisper.cpp](https://github.com/ggml-org/whisper.cpp)), so your audio never
 leaves your computer and there's nothing to pay for.
 
