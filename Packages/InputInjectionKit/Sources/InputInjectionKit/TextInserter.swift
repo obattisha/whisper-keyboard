@@ -46,9 +46,9 @@ public enum TextInserter {
         }
 
         let target = focusedApplication()
-        let electron = isElectron(target)
-        logger.notice("insert: target=\(target?.bundleIdentifier ?? "nil", privacy: .public) electron=\(electron, privacy: .public)")
-        if !electron, insertViaAccessibilityAPI(text) {
+        let chromium = isChromium(target)
+        logger.notice("insert: target=\(target?.bundleIdentifier ?? "nil", privacy: .public) chromium=\(chromium, privacy: .public)")
+        if !chromium, insertViaAccessibilityAPI(text) {
             logger.notice("insert: AX path reported success")
             return
         }
@@ -56,15 +56,20 @@ public enum TextInserter {
         insertViaPasteboard(text)
     }
 
-    /// Electron apps (Claude desktop, Slack, VS Code, ...) report `kAXSelectedTextAttribute`
-    /// as settable on their rich-text editors and return `.success` when it's set, but the
-    /// editor (ProseMirror, Monaco, etc.) never sees the change, so nothing appears. That
-    /// "success" also skipped the paste fallback, leaving the text only in Recent
+    /// Chromium-based apps, meaning Electron apps (Claude desktop, Slack, VS Code, ...) and
+    /// Chromium browsers (Chrome, Edge, Brave, ...), report `kAXSelectedTextAttribute` as
+    /// settable on web rich-text editors and return `.success` when it's set, but the editor
+    /// (ProseMirror on claude.ai, Monaco, etc.) never sees the change, so nothing appears.
+    /// That "success" also skipped the paste fallback, leaving the text only in Recent
     /// Transcriptions. Go straight to pasting for these apps.
-    private static func isElectron(_ app: NSRunningApplication?) -> Bool {
+    ///
+    /// They all bundle Chromium as "<Name> Framework.framework" ("Electron Framework",
+    /// "Google Chrome Framework", "Microsoft Edge Framework"), so match on that.
+    private static func isChromium(_ app: NSRunningApplication?) -> Bool {
         guard let bundleURL = app?.bundleURL else { return false }
-        let electronFramework = bundleURL.appendingPathComponent("Contents/Frameworks/Electron Framework.framework")
-        return FileManager.default.fileExists(atPath: electronFramework.path)
+        let frameworks = bundleURL.appendingPathComponent("Contents/Frameworks")
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: frameworks.path)) ?? []
+        return names.contains { $0.hasSuffix(" Framework.framework") }
     }
 
     /// The app that owns keyboard focus, asked of Accessibility rather than
