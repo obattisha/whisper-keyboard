@@ -43,6 +43,8 @@ final class SampleStore: @unchecked Sendable {
     private struct Storage {
         var samples: [Float] = []
         var hasReceivedAudio = false
+        /// RMS of the most recent chunk, for the on-screen level meter.
+        var level: Float = 0
         var onFirstBuffer: (@Sendable () -> Void)?
     }
 
@@ -57,8 +59,12 @@ final class SampleStore: @unchecked Sendable {
     /// Audio thread.
     func append(_ frames: UnsafeBufferPointer<Float>) {
         guard !frames.isEmpty else { return }
+        var sumOfSquares: Float = 0
+        for sample in frames { sumOfSquares += sample * sample }
+        let rms = (sumOfSquares / Float(frames.count)).squareRoot()
         let notify: (@Sendable () -> Void)? = storage.withLockUnchecked { state in
             state.samples.append(contentsOf: frames)
+            state.level = rms
             guard !state.hasReceivedAudio else { return nil }
             state.hasReceivedAudio = true
             return state.onFirstBuffer
@@ -71,13 +77,19 @@ final class SampleStore: @unchecked Sendable {
         storage.withLock { state in
             state.samples.removeAll(keepingCapacity: true)
             state.hasReceivedAudio = false
+            state.level = 0
         }
+    }
+
+    func level() -> Float {
+        storage.withLock { $0.level }
     }
 
     func drain() -> [Float] {
         storage.withLock { state in
             let captured = state.samples
             state.samples = []
+            state.level = 0
             return captured
         }
     }
@@ -546,6 +558,15 @@ public final class AudioRecorder {
     public var onCaptureBegan: (@MainActor () -> Void)?
 
     public init() {}
+
+    /// How loud the input is right now, 0 (silence) to 1 (shouting), on a log scale so
+    /// normal speech lands mid-range. Cheap enough to poll every frame for a level meter.
+    public var currentLevel: Float {
+        let rms = store.level()
+        guard rms > 0 else { return 0 }
+        let decibels = 20 * log10(rms)
+        return min(max((decibels + 50) / 40, 0), 1)
+    }
 
     public static func requestMicrophonePermission() async -> Bool {
         await withCheckedContinuation { continuation in

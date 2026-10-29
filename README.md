@@ -43,9 +43,11 @@ A setup window walks you through three things:
 ## Using it
 
 Hold **Control + Option + Space** while you talk, then let go. The text shows up a second
-or two later.
+or two later. While it's listening, the menu bar icon becomes a moving waveform and a small
+bubble shows near the bottom of the screen. You can turn the bubble off in **Settings…**
+(in the mic icon's menu).
 
-The **Fn (🌐) key** is easier to hold. To use it, choose **Change Hotkey…** from the mic icon
+The **Fn (🌐) key** is easier to hold. To use it, choose **Settings…** from the mic icon
 in the menu bar and turn on "Also hold Fn (🌐) to talk." Then in **System
 Settings > Keyboard**, set "Press 🌐 key to" to **Do Nothing**, or macOS will also pop up
 the emoji picker every time.
@@ -115,8 +117,8 @@ installs can't be updated.
 - `Packages/AudioCaptureKit`: microphone capture, resampled to the 16 kHz mono Float32
   Whisper expects.
 - `Packages/InputInjectionKit`: types text through the Accessibility API, falling back to a
-  clipboard paste for apps that ignore it (Electron apps like Claude, Slack and VS Code
-  always get the paste).
+  clipboard paste for apps that ignore it (Electron apps like Claude, Slack and VS Code, and
+  Chromium browsers like Chrome, always get the paste).
 - `Vendor/whisper.cpp`: git submodule pinned to a tagged release, built with its own
   `build-xcframework.sh`.
 

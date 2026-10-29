@@ -70,6 +70,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var isLoadingModel = false
     private var errorClearTask: Task<Void, Never>?
     private let fnMonitor = FnKeyMonitor()
+    private let indicator = RecordingIndicator()
+    /// Polls the mic level while recording, driving the menu bar and bubble waveforms.
+    private var meterTask: Task<Void, Never>?
     private var fnSettingObserver: AnyCancellable?
 
     override init() {
@@ -392,9 +395,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         rebuildRecentTranscriptionsMenu()
         menu.addItem(.separator())
 
-        let hotkeyItem = NSMenuItem(title: "Change Hotkey…", action: #selector(openSettings), keyEquivalent: "")
-        hotkeyItem.target = self
-        menu.addItem(hotkeyItem)
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
 
         let languageMenu = NSMenu()
         languageMenu.autoenablesItems = false
@@ -478,6 +481,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             statusLineItem.title = message
             statusItem.button?.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil)
         }
+        updateIndicator()
 
         for (hint, item) in languageItems {
             item.state = (hint == settings.languageHint) ? .on : .off
@@ -508,6 +512,33 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                     ? "Load Model…"
                     : "Download Model…"
             }
+        }
+    }
+
+    private func updateIndicator() {
+        let phase: RecordingIndicator.Phase
+        switch state {
+        case .preparingMicrophone: phase = .starting
+        case .recording: phase = .listening
+        case .transcribing: phase = .transcribing
+        default: phase = .hidden
+        }
+        indicator.show(phase, bubble: settings.showRecordingBubble)
+
+        if phase == .listening {
+            statusItem.button?.image = RecordingIndicator.menuBarImage(levels: indicator.levels)
+            guard meterTask == nil else { return }
+            meterTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    guard let self else { return }
+                    self.indicator.push(level: self.recorder.currentLevel)
+                    self.statusItem.button?.image = RecordingIndicator.menuBarImage(levels: self.indicator.levels)
+                    try? await Task.sleep(nanoseconds: 50 * NSEC_PER_MSEC)
+                }
+            }
+        } else {
+            meterTask?.cancel()
+            meterTask = nil
         }
     }
 

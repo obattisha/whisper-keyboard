@@ -40,6 +40,13 @@ struct SettingsView: View {
                 }
             }
 
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Show a bubble on screen while recording", isOn: $settings.showRecordingBubble)
+                Text("The menu bar icon turns into a live waveform either way.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Picker("Language:", selection: $settings.languageHint) {
                 Text("Auto-detect").tag(LanguageHint.auto)
                 Text("English").tag(LanguageHint.english)
